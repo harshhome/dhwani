@@ -1,0 +1,16 @@
+# Local runtime data
+data/
+downloads/
+local/
+
+# Local examples and private env files
+examples/
+.env
+.env.*
+Makefile
+
+# Build/test artifacts
+src/coverage.out
+
+# OS/editor noise
+.DS_Store
