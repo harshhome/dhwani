@@ -218,3 +218,223 @@ LIMIT 1
 		return model.Album{}, err
 	}
 	return a, nil
+}
+
+func (s *Store) GetAlbumMetadataAny(ctx context.Context, providerID string) (model.Album, error) {
+	if s == nil || s.DB == nil {
+		return model.Album{}, sql.ErrNoRows
+	}
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return model.Album{}, sql.ErrNoRows
+	}
+	row := s.DB.QueryRowContext(ctx, `
+SELECT provider_id, provider, provider_id, artist_id, artist, name, song_count, duration_sec, year, cover_art_url
+FROM album_metadata
+WHERE provider_id = ?
+ORDER BY updated_at DESC
+LIMIT 1
+`, providerID)
+	var a model.Album
+	if err := row.Scan(
+		&a.ID, &a.Provider, &a.ProviderID, &a.ArtistID, &a.Artist, &a.Name,
+		&a.SongCount, &a.DurationSec, &a.Year, &a.CoverArtURL,
+	); err != nil {
+		return model.Album{}, err
+	}
+	return a, nil
+}
+
+func (s *Store) GetTrackMetadata(ctx context.Context, providerName, providerID string) (model.Track, error) {
+	if s == nil || s.DB == nil {
+		return model.Track{}, sql.ErrNoRows
+	}
+	row := s.DB.QueryRowContext(ctx, `
+SELECT provider_id, title, artist, COALESCE(display_artist, ''), album, genre, artist_id, album_id,
+       duration_sec, track_number, disc_number, bit_rate, content_type, cover_art_url
+FROM track_metadata
+WHERE provider = ? AND provider_id = ?
+`, providerName, providerID)
+
+	var t model.Track
+	t.Provider = providerName
+	t.ProviderID = providerID
+	err := row.Scan(
+		&t.ID,
+		&t.Title,
+		&t.Artist,
+		&t.DisplayArtist,
+		&t.Album,
+		&t.Genre,
+		&t.ArtistID,
+		&t.AlbumID,
+		&t.DurationSec,
+		&t.TrackNumber,
+		&t.DiscNumber,
+		&t.BitRate,
+		&t.ContentType,
+		&t.CoverArtURL,
+	)
+	if err != nil {
+		return model.Track{}, err
+	}
+	return t, nil
+}
+
+func (s *Store) GetTrackMetadataByID(ctx context.Context, id string) (model.Track, error) {
+	if s == nil || s.DB == nil {
+		return model.Track{}, sql.ErrNoRows
+	}
+	row := s.DB.QueryRowContext(ctx, `
+SELECT provider, provider_id, provider_id, title, artist, COALESCE(display_artist, ''), album, genre, artist_id, album_id,
+       duration_sec, track_number, disc_number, bit_rate, content_type, cover_art_url
+FROM track_metadata
+WHERE provider_id = ?
+LIMIT 1
+`, id)
+	var t model.Track
+	err := row.Scan(
+		&t.Provider,
+		&t.ProviderID,
+		&t.ID,
+		&t.Title,
+		&t.Artist,
+		&t.DisplayArtist,
+		&t.Album,
+		&t.Genre,
+		&t.ArtistID,
+		&t.AlbumID,
+		&t.DurationSec,
+		&t.TrackNumber,
+		&t.DiscNumber,
+		&t.BitRate,
+		&t.ContentType,
+		&t.CoverArtURL,
+	)
+	if err != nil {
+		return model.Track{}, err
+	}
+	return t, nil
+}
+
+func (s *Store) GetAnyTrackMetadataByProviderID(ctx context.Context, providerID string) (model.Track, error) {
+	if s == nil || s.DB == nil {
+		return model.Track{}, sql.ErrNoRows
+	}
+	row := s.DB.QueryRowContext(ctx, `
+SELECT provider, provider_id, provider_id, title, artist, COALESCE(display_artist, ''), album, genre, artist_id, album_id,
+       duration_sec, track_number, disc_number, bit_rate, content_type, cover_art_url
+FROM track_metadata
+WHERE provider_id = ?
+ORDER BY updated_at DESC
+LIMIT 1
+`, providerID)
+	var t model.Track
+	err := row.Scan(
+		&t.Provider,
+		&t.ProviderID,
+		&t.ID,
+		&t.Title,
+		&t.Artist,
+		&t.DisplayArtist,
+		&t.Album,
+		&t.Genre,
+		&t.ArtistID,
+		&t.AlbumID,
+		&t.DurationSec,
+		&t.TrackNumber,
+		&t.DiscNumber,
+		&t.BitRate,
+		&t.ContentType,
+		&t.CoverArtURL,
+	)
+	if err != nil {
+		return model.Track{}, err
+	}
+	return t, nil
+}
+
+func (s *Store) ListCachedArtists(ctx context.Context, limit int) ([]model.Artist, error) {
+	if s == nil || s.DB == nil {
+		return nil, sql.ErrNoRows
+	}
+	if limit <= 0 {
+		limit = 1000
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+SELECT DISTINCT artist_id, artist
+FROM track_metadata
+WHERE artist_id != '' AND artist != ''
+ORDER BY artist
+LIMIT ?
+`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]model.Artist, 0)
+	for rows.Next() {
+		var a model.Artist
+		if err := rows.Scan(&a.ID, &a.Name); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListCachedAlbums(ctx context.Context, limit int, offset int) ([]model.Album, error) {
+	if s == nil || s.DB == nil {
+		return nil, sql.ErrNoRows
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+SELECT album_id, album, artist_id, artist, COUNT(*) as song_count, COALESCE(SUM(duration_sec), 0) as duration_sec
+FROM track_metadata
+WHERE album_id != '' AND album != ''
+GROUP BY album_id, album, artist_id, artist
+ORDER BY album
+LIMIT ? OFFSET ?
+`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]model.Album, 0)
+	for rows.Next() {
+		var a model.Album
+		if err := rows.Scan(&a.ID, &a.Name, &a.ArtistID, &a.Artist, &a.SongCount, &a.DurationSec); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListCachedAlbumsByArtist(ctx context.Context, artistID string, limit int, offset int) ([]model.Album, error) {
+	if s == nil || s.DB == nil {
+		return nil, sql.ErrNoRows
+	}
+	if limit <= 0 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+SELECT album_id, album, artist_id, artist, COUNT(*) as song_count, COALESCE(SUM(duration_sec), 0) as duration_sec
+FROM track_metadata
+WHERE artist_id = ? AND album_id != '' AND album != ''
+GROUP BY album_id, album, artist_id, artist
+ORDER BY album
+LIMIT ? OFFSET ?
+`, artistID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
