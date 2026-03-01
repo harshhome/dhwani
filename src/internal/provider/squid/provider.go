@@ -478,3 +478,243 @@ func (p *Provider) fetchTrackInfoPayload(ctx context.Context, trackProviderID st
 	}
 	u.Path = joinPath(u.Path, "info")
 	q := u.Query()
+	q.Set("id", trackProviderID)
+	if p.cfg.Source != "" {
+		q.Set("source", p.cfg.Source)
+	}
+	u.RawQuery = q.Encode()
+	return p.getJSON(ctx, u.String())
+}
+
+func (p *Provider) findTrackBySearch(ctx context.Context, trackProviderID string) (model.Track, error) {
+	u, err := url.Parse(p.cfg.BaseURL)
+	if err != nil {
+		return model.Track{}, err
+	}
+	u.Path = joinPath(u.Path, "search")
+	q := u.Query()
+	q.Set("s", trackProviderID)
+	q.Set("limit", "50")
+	q.Set("a", "1")
+	q.Set("al", "1")
+	q.Set("v", "0")
+	q.Set("p", "0")
+	if p.cfg.Source != "" {
+		q.Set("source", p.cfg.Source)
+	}
+	u.RawQuery = q.Encode()
+
+	body, err := p.getJSON(ctx, u.String())
+	if err != nil {
+		return model.Track{}, err
+	}
+	for _, t := range extractList(body, "items", "tracks", "songs", "song", "results") {
+		tr := normalizeTrackMap(p.cfg.Name, t)
+		if tr.ProviderID == trackProviderID {
+			return tr, nil
+		}
+	}
+	return model.Track{}, provider.ErrNotFound
+}
+
+func (p *Provider) searchAlbumFallback(ctx context.Context, albumProviderID string) (model.Album, []model.Track, error) {
+	u, err := url.Parse(p.cfg.BaseURL)
+	if err != nil {
+		return model.Album{}, nil, err
+	}
+	u.Path = joinPath(u.Path, "search")
+	q := u.Query()
+	q.Set("s", albumProviderID)
+	q.Set("limit", "500")
+	q.Set("a", "1")
+	q.Set("al", "1")
+	q.Set("v", "0")
+	q.Set("p", "0")
+	if p.cfg.Source != "" {
+		q.Set("source", p.cfg.Source)
+	}
+	u.RawQuery = q.Encode()
+
+	body, err := p.getJSON(ctx, u.String())
+	if err != nil {
+		return model.Album{}, nil, err
+	}
+	targetAlbumID := albumProviderID
+	tracks := make([]model.Track, 0)
+	for _, t := range extractList(body, "tracks", "songs", "song", "results", "items") {
+		tr := normalizeTrackMap(p.cfg.Name, t)
+		if tr.ID == "" || tr.AlbumID != targetAlbumID {
+			continue
+		}
+		tracks = append(tracks, tr)
+	}
+	if len(tracks) == 0 {
+		return model.Album{}, nil, provider.ErrNotFound
+	}
+	sort.SliceStable(tracks, func(i, j int) bool {
+		if tracks[i].DiscNumber != tracks[j].DiscNumber {
+			return tracks[i].DiscNumber < tracks[j].DiscNumber
+		}
+		if tracks[i].TrackNumber != tracks[j].TrackNumber {
+			return tracks[i].TrackNumber < tracks[j].TrackNumber
+		}
+		return strings.ToLower(tracks[i].Title) < strings.ToLower(tracks[j].Title)
+	})
+	dur := 0
+	for _, t := range tracks {
+		dur += t.DurationSec
+	}
+	alb := model.Album{
+		ID:          targetAlbumID,
+		Provider:    p.cfg.Name,
+		ProviderID:  albumProviderID,
+		Name:        tracks[0].Album,
+		Artist:      tracks[0].Artist,
+		ArtistID:    tracks[0].ArtistID,
+		SongCount:   len(tracks),
+		DurationSec: dur,
+		CoverArtURL: tracks[0].CoverArtURL,
+	}
+	return alb, tracks, nil
+}
+
+func (p *Provider) getJSON(ctx context.Context, target string) (map[string]any, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	if p.cfg.ClientHeader != "" {
+		req.Header.Set("x-client", p.cfg.ClientHeader)
+	}
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, provider.ErrNotFound
+	}
+	if resp.StatusCode >= 400 {
+		return nil, providerStatusError{statusCode: resp.StatusCode}
+	}
+
+	var payload map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	return unwrap(payload), nil
+}
+
+type TrackManifest struct {
+	MIMEType       string   `json:"mimeType"`
+	Codecs         string   `json:"codecs"`
+	EncryptionType string   `json:"encryptionType"`
+	URLs           []string `json:"urls"`
+}
+
+func DecodeManifest(manifestB64 string) (TrackManifest, error) {
+	b, err := base64.StdEncoding.DecodeString(manifestB64)
+	if err != nil {
+		return TrackManifest{}, fmt.Errorf("base64 decode: %w", err)
+	}
+	var m TrackManifest
+	if err := json.Unmarshal(b, &m); err != nil {
+		return TrackManifest{}, fmt.Errorf("manifest json decode: %w", err)
+	}
+	return m, nil
+}
+
+func normalizeSearch(providerName string, payload map[string]any) model.SearchResult {
+	result := model.SearchResult{}
+	artists := extractList(payload, "artists", "artist", "artistResults")
+	for _, a := range artists {
+		result.Artists = append(result.Artists, normalizeArtistMap(providerName, a))
+	}
+	albums := extractList(payload, "albums", "album", "albumResults")
+	for _, a := range albums {
+		result.Albums = append(result.Albums, normalizeAlbumMap(providerName, a))
+	}
+	tracks := extractList(payload, "tracks", "songs", "song", "results", "items")
+	for _, t := range tracks {
+		if tr := normalizeTrackMap(providerName, t); tr.ID != "" {
+			result.Tracks = append(result.Tracks, tr)
+			if tr.ArtistID != "" {
+				result.Artists = append(result.Artists, model.Artist{
+					ID:         tr.ArtistID,
+					Provider:   providerName,
+					ProviderID: tr.ArtistID,
+					Name:       tr.Artist,
+				})
+			}
+			if tr.AlbumID != "" {
+				result.Albums = append(result.Albums, model.Album{
+					ID:         tr.AlbumID,
+					Provider:   providerName,
+					ProviderID: tr.AlbumID,
+					ArtistID:   tr.ArtistID,
+					Artist:     tr.Artist,
+					Name:       tr.Album,
+				})
+			}
+		}
+	}
+	return result
+}
+
+func normalizeArtistMap(providerName string, m map[string]any) model.Artist {
+	src := m
+	if nested := getMap(m, "artist"); nested != nil {
+		src = nested
+	}
+	coverMap := getMap(m, "cover")
+
+	providerID := firstNonEmpty(
+		getString(src, "id"),
+		getString(src, "artistId"),
+		getString(src, "uuid"),
+	)
+	if providerID == "" {
+		return model.Artist{}
+	}
+	return model.Artist{
+		ID:         providerID,
+		Provider:   providerName,
+		ProviderID: providerID,
+		Name:       firstNonEmpty(getString(src, "name"), getString(src, "artist")),
+		CoverArtURL: normalizeImageRef(firstNonEmpty(
+			getString(src, "cover"),
+			getString(src, "image"),
+			getString(src, "coverArt"),
+			getString(src, "picture"),
+			getString(coverMap, "750"),
+			getString(coverMap, "640"),
+			getString(coverMap, "320"),
+		)),
+	}
+}
+
+func normalizeAlbumMap(providerName string, m map[string]any) model.Album {
+	providerID := firstNonEmpty(
+		getString(m, "id"),
+		getString(m, "albumId"),
+	)
+	if providerID == "" {
+		return model.Album{}
+	}
+	artistObj := getMap(m, "artist")
+	artistProviderID := firstNonEmpty(getString(m, "artistId"), getString(m, "artist_id"), getString(artistObj, "id"))
+	artistName := firstNonEmpty(getString(m, "artist"), getString(m, "artistName"), getString(artistObj, "name"))
+	if artistProviderID == "" || artistName == "" {
+		mainID, mainName := pickMainAlbumArtist(m)
+		if artistProviderID == "" {
+			artistProviderID = mainID
+		}
+		if artistName == "" {
+			artistName = mainName
+		}
+	}
+	artistID := ""
+	if artistProviderID != "" {
