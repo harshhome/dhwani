@@ -718,3 +718,243 @@ func normalizeAlbumMap(providerName string, m map[string]any) model.Album {
 	}
 	artistID := ""
 	if artistProviderID != "" {
+		artistID = artistProviderID
+	}
+	yearRaw := firstNonEmpty(
+		getString(m, "year"),
+		getString(m, "releaseYear"),
+		yearFromDateString(getString(m, "releaseDate")),
+		yearFromDateString(getString(m, "originalReleaseDate")),
+	)
+	if yearRaw == "" {
+		streamStartDate := strings.TrimSpace(getString(m, "streamStartDate"))
+		if len(streamStartDate) >= 4 {
+			yearRaw = streamStartDate[:4]
+		}
+	}
+	year, _ := strconv.Atoi(yearRaw)
+	return model.Album{
+		ID:          providerID,
+		Provider:    providerName,
+		ProviderID:  providerID,
+		ArtistID:    artistID,
+		Artist:      artistName,
+		Name:        firstNonEmpty(getString(m, "title"), getString(m, "name"), getString(m, "album")),
+		Year:        year,
+		CoverArtURL: normalizeImageRef(firstNonEmpty(getString(m, "cover"), getString(m, "image"), getString(m, "coverArt"))),
+	}
+}
+
+func pickMainAlbumArtist(m map[string]any) (id string, name string) {
+	artists := extractList(m, "artists", "artist")
+	if len(artists) == 0 {
+		return "", ""
+	}
+	for _, a := range artists {
+		typ := strings.ToUpper(strings.TrimSpace(getString(a, "type")))
+		if typ == "MAIN" {
+			return firstNonEmpty(getString(a, "id"), getString(a, "artistId"), getString(a, "artist_id")),
+				firstNonEmpty(getString(a, "name"), getString(a, "artist"), getString(a, "artistName"))
+		}
+	}
+	a := artists[0]
+	return firstNonEmpty(getString(a, "id"), getString(a, "artistId"), getString(a, "artist_id")),
+		firstNonEmpty(getString(a, "name"), getString(a, "artist"), getString(a, "artistName"))
+}
+
+func yearFromDateString(v string) string {
+	v = strings.TrimSpace(v)
+	if len(v) < 4 {
+		return ""
+	}
+	y := v[:4]
+	for _, r := range y {
+		if r < '0' || r > '9' {
+			return ""
+		}
+	}
+	return y
+}
+
+func normalizeTrackMap(providerName string, m map[string]any) model.Track {
+	albumObj := getMap(m, "album")
+	artists := extractTrackArtists(m)
+	var artistObj map[string]any
+	if len(artists) > 0 {
+		artistObj = map[string]any{
+			"id":   artists[0].ID,
+			"name": artists[0].Name,
+		}
+	}
+
+	providerID := firstNonEmpty(getString(m, "trackId"), getString(m, "id"), getString(m, "songId"))
+	if providerID == "" {
+		return model.Track{}
+	}
+	albumProviderID := firstNonEmpty(getString(m, "albumId"), getString(m, "album_id"), getString(albumObj, "id"))
+	artistProviderID := firstNonEmpty(getString(m, "artistId"), getString(m, "artist_id"), getString(artistObj, "id"))
+
+	albumID := ""
+	if albumProviderID != "" {
+		albumID = albumProviderID
+	}
+	artistID := ""
+	if artistProviderID != "" {
+		artistID = artistProviderID
+	}
+
+	dur, _ := strconv.Atoi(firstNonEmpty(getString(m, "duration"), getString(m, "durationSec"), getString(m, "durationSeconds")))
+	bitRate, _ := strconv.Atoi(getString(m, "bitRate"))
+	trackNo, _ := strconv.Atoi(firstNonEmpty(getString(m, "trackNumber"), getString(m, "track")))
+	discNo, _ := strconv.Atoi(firstNonEmpty(getString(m, "volumeNumber"), getString(m, "discNumber")))
+	displayArtist := formatDisplayArtistNames(artists)
+
+	return model.Track{
+		ID:            providerID,
+		Provider:      providerName,
+		ProviderID:    providerID,
+		ProviderRawID: providerID,
+		AlbumID:       albumID,
+		ArtistID:      artistID,
+		Title:         firstNonEmpty(getString(m, "title"), getString(m, "name")),
+		Artist:        firstNonEmpty(getString(m, "artist"), getString(m, "artistName"), getString(artistObj, "name")),
+		DisplayArtist: displayArtist,
+		Artists:       artists,
+		Album:         firstNonEmpty(getString(m, "album"), getString(m, "albumTitle"), getString(albumObj, "title"), getString(albumObj, "name")),
+		Genre:         firstNonEmpty(getString(m, "genre"), getString(m, "genreName")),
+		DurationSec:   dur,
+		TrackNumber:   trackNo,
+		DiscNumber:    discNo,
+		BitRate:       bitRate,
+		ContentType:   firstNonEmpty(getString(m, "manifestMimeType"), getString(m, "mimeType"), "audio/flac"),
+		CoverArtURL: normalizeImageRef(firstNonEmpty(
+			getString(m, "cover"),
+			getString(m, "image"),
+			getString(m, "coverArt"),
+			getString(albumObj, "cover"),
+			getString(artistObj, "picture"),
+		)),
+	}
+}
+
+func extractList(m map[string]any, keys ...string) []map[string]any {
+	for _, key := range keys {
+		v, ok := m[key]
+		if !ok || v == nil {
+			continue
+		}
+		switch arr := v.(type) {
+		case []any:
+			out := make([]map[string]any, 0, len(arr))
+			for _, item := range arr {
+				if mm, ok := item.(map[string]any); ok {
+					out = append(out, mm)
+				}
+			}
+			return out
+		case map[string]any:
+			return []map[string]any{arr}
+		}
+	}
+	return nil
+}
+
+func unwrap(payload map[string]any) map[string]any {
+	for _, key := range []string{"data", "result", "results", "response"} {
+		if v, ok := payload[key].(map[string]any); ok {
+			return v
+		}
+	}
+	return payload
+}
+
+func getString(m map[string]any, keys ...string) string {
+	if m == nil {
+		return ""
+	}
+	for _, key := range keys {
+		v, ok := m[key]
+		if !ok || v == nil {
+			continue
+		}
+		switch t := v.(type) {
+		case string:
+			if t != "" {
+				return t
+			}
+		case json.Number:
+			return t.String()
+		case float64:
+			return strconv.FormatInt(int64(t), 10)
+		case int:
+			return strconv.Itoa(t)
+		case int64:
+			return strconv.FormatInt(t, 10)
+		}
+	}
+	return ""
+}
+
+func getMap(m map[string]any, key string) map[string]any {
+	if m == nil {
+		return nil
+	}
+	if v, ok := m[key].(map[string]any); ok {
+		return v
+	}
+	return nil
+}
+
+func extractLyricsLines(m map[string]any) []string {
+	keys := []string{"lines", "lyrics", "lyric"}
+	for _, key := range keys {
+		v, ok := m[key]
+		if !ok || v == nil {
+			continue
+		}
+		arr, ok := v.([]any)
+		if !ok {
+			continue
+		}
+		out := make([]string, 0, len(arr))
+		for _, item := range arr {
+			switch t := item.(type) {
+			case string:
+				if strings.TrimSpace(t) != "" {
+					out = append(out, t)
+				}
+			case map[string]any:
+				line := firstNonEmpty(getString(t, "text"), getString(t, "line"), getString(t, "lyrics"))
+				if strings.TrimSpace(line) != "" {
+					out = append(out, line)
+				}
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return nil
+}
+
+func parseLRCSubtitles(raw string) []model.LyricLine {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	lines := strings.Split(raw, "\n")
+	out := make([]model.LyricLine, 0, len(lines))
+	for _, ln := range lines {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		if !strings.HasPrefix(ln, "[") {
+			continue
+		}
+		end := strings.IndexByte(ln, ']')
+		if end <= 1 {
+			continue
+		}
+		ts := ln[1:end]
+		text := strings.TrimSpace(ln[end+1:])
