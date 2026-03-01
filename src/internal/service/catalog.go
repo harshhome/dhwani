@@ -438,3 +438,223 @@ func (s *CatalogService) ListAlbumsByArtist(ctx context.Context, artistID string
 
 func (s *CatalogService) ListTracks(ctx context.Context, limit int, offset int) ([]model.Track, error) {
 	if s.store == nil {
+		return []model.Track{}, nil
+	}
+	tracks, err := s.store.ListCachedTracks(ctx, limit, offset)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return []model.Track{}, nil
+		}
+		return nil, err
+	}
+	return tracks, nil
+}
+
+func (s *CatalogService) ListTracksByAlbum(ctx context.Context, albumID string, limit int, offset int) ([]model.Track, error) {
+	if s.store == nil {
+		return []model.Track{}, nil
+	}
+	tracks, err := s.store.ListCachedTracksByAlbum(ctx, albumID, limit, offset)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return []model.Track{}, nil
+		}
+		return nil, err
+	}
+	return tracks, nil
+}
+
+func (s *CatalogService) ListTracksByArtist(ctx context.Context, artistID string, limit int, offset int) ([]model.Track, error) {
+	if s.store == nil {
+		return []model.Track{}, nil
+	}
+	tracks, err := s.store.ListCachedTracksByArtist(ctx, artistID, limit, offset)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return []model.Track{}, nil
+		}
+		return nil, err
+	}
+	return tracks, nil
+}
+
+func (s *CatalogService) ListTracksByGenre(ctx context.Context, genre string, limit int, offset int) ([]model.Track, error) {
+	if s.store == nil {
+		return []model.Track{}, nil
+	}
+	tracks, err := s.store.ListCachedTracksByGenre(ctx, genre, limit, offset)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return []model.Track{}, nil
+		}
+		return nil, err
+	}
+	return tracks, nil
+}
+
+func (s *CatalogService) GetCachedAlbum(ctx context.Context, albumID string) (model.Album, error) {
+	if s.store == nil {
+		return model.Album{}, sql.ErrNoRows
+	}
+	return s.store.GetCachedAlbum(ctx, albumID)
+}
+
+func (s *CatalogService) GetCachedAlbumAny(ctx context.Context, id string) (model.Album, error) {
+	if s.store == nil {
+		return model.Album{}, sql.ErrNoRows
+	}
+	if alb, err := s.store.GetCachedAlbum(ctx, id); err == nil {
+		return alb, nil
+	}
+	return s.store.GetCachedAlbumAny(ctx, id)
+}
+
+func (s *CatalogService) GetAlbumMetadataAny(ctx context.Context, id string) (model.Album, error) {
+	if s.store == nil {
+		return model.Album{}, sql.ErrNoRows
+	}
+	return s.store.GetAlbumMetadataAny(ctx, id)
+}
+
+func (s *CatalogService) GetCachedArtist(ctx context.Context, artistID string) (model.Artist, error) {
+	if s.store == nil {
+		return model.Artist{}, sql.ErrNoRows
+	}
+	return s.store.GetCachedArtist(ctx, artistID)
+}
+
+func (s *CatalogService) GetCachedArtistAny(ctx context.Context, id string) (model.Artist, error) {
+	if s.store == nil {
+		return model.Artist{}, sql.ErrNoRows
+	}
+	if art, err := s.store.GetCachedArtist(ctx, id); err == nil {
+		return art, nil
+	}
+	return s.store.GetCachedArtistAny(ctx, id)
+}
+
+func (s *CatalogService) GetCachedTrackAny(ctx context.Context, id string) (model.Track, error) {
+	if s.store == nil {
+		return model.Track{}, sql.ErrNoRows
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return model.Track{}, sql.ErrNoRows
+	}
+	if t, ok := s.recentTrack(id); ok && trackHasEssentialMetadata(t) {
+		return t, nil
+	}
+	if t, ok := s.recentTrackByRawID(id); ok && trackHasEssentialMetadata(t) {
+		return t, nil
+	}
+	if t, err := s.store.GetTrackMetadataByID(ctx, id); err == nil && trackHasEssentialMetadata(t) {
+		return t, nil
+	}
+	if t, err := s.store.GetAnyTrackMetadataByProviderID(ctx, id); err == nil && trackHasEssentialMetadata(t) {
+		return t, nil
+	}
+	return model.Track{}, sql.ErrNoRows
+}
+
+func (s *CatalogService) ResolveCoverArtURL(ctx context.Context, id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ""
+	}
+	if u := s.coverArtFromRecent(id); u != "" {
+		return u
+	}
+	if t, err := s.GetCachedTrackAny(ctx, id); err == nil && strings.TrimSpace(t.CoverArtURL) != "" {
+		return t.CoverArtURL
+	}
+	if a, err := s.GetCachedAlbumAny(ctx, id); err == nil && strings.TrimSpace(a.CoverArtURL) != "" {
+		return a.CoverArtURL
+	}
+	if a, err := s.GetCachedArtistAny(ctx, id); err == nil && strings.TrimSpace(a.CoverArtURL) != "" {
+		return a.CoverArtURL
+	}
+	return ""
+}
+
+func (s *CatalogService) RandomTracks(ctx context.Context, limit int) ([]model.Track, error) {
+	if s.store == nil {
+		return []model.Track{}, nil
+	}
+	tracks, err := s.store.RandomCachedTracks(ctx, limit)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return []model.Track{}, nil
+		}
+		// Fallback to latest tracks if RANDOM query path fails on an existing DB.
+		fallback, fbErr := s.store.ListCachedTracks(ctx, limit, 0)
+		if fbErr == nil {
+			return fallback, nil
+		}
+		return nil, err
+	}
+	return tracks, nil
+}
+
+func (s *CatalogService) ListGenres(ctx context.Context, limit int) ([]string, error) {
+	if s.store == nil {
+		return []string{}, nil
+	}
+	genres, err := s.store.ListCachedGenres(ctx, limit)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return []string{}, nil
+		}
+		return nil, err
+	}
+	return genres, nil
+}
+
+func (s *CatalogService) EnsureWarmIndex(ctx context.Context, q string) {
+	if s.store == nil || strings.TrimSpace(q) == "" {
+		return
+	}
+	res, err := s.Search(ctx, q, 50)
+	if err != nil {
+		return
+	}
+	if err := s.PersistMappings(ctx, res); err != nil {
+		s.logger.Warn("persist mappings failed during warm index", "query", q, "err", err)
+	}
+}
+
+func (s *CatalogService) providerCandidates(id string) (rawID string, candidates []provider.Provider, preferredProvider string, err error) {
+	enabled := s.registry.Enabled()
+	if len(enabled) == 0 {
+		return "", nil, "", fmt.Errorf("no providers enabled")
+	}
+	rawID = strings.TrimSpace(id)
+	if rawID == "" {
+		return "", nil, "", fmt.Errorf("empty id")
+	}
+	ranked := s.rankProviders(enabled)
+	return rawID, ranked, ranked[0].Name(), nil
+}
+
+func (s *CatalogService) PersistMappings(ctx context.Context, result model.SearchResult) error {
+	if s.store == nil {
+		return nil
+	}
+	var firstErr error
+	for _, a := range result.Artists {
+		if err := s.store.UpsertArtistMetadata(ctx, a); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			s.logger.Warn("artist mapping upsert failed", "provider", a.Provider, "provider_id", a.ProviderID, "err", err)
+		}
+	}
+	for _, a := range result.Albums {
+		if err := s.store.UpsertAlbumMetadata(ctx, a); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			s.logger.Warn("album mapping upsert failed", "provider", a.Provider, "provider_id", a.ProviderID, "err", err)
+		}
+	}
+	for _, t := range result.Tracks {
+		if err := s.store.UpsertTrackMetadata(ctx, t); err != nil {
