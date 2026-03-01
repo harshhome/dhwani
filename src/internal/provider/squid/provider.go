@@ -958,3 +958,259 @@ func parseLRCSubtitles(raw string) []model.LyricLine {
 		}
 		ts := ln[1:end]
 		text := strings.TrimSpace(ln[end+1:])
+		if text == "" {
+			continue
+		}
+		ms, ok := parseLRCTimestamp(ts)
+		if !ok {
+			continue
+		}
+		out = append(out, model.LyricLine{StartMs: ms, Value: text})
+	}
+	return out
+}
+
+func parseLRCTimestamp(v string) (int64, bool) {
+	parts := strings.SplitN(strings.TrimSpace(v), ":", 2)
+	if len(parts) != 2 {
+		return 0, false
+	}
+	minutes, err := strconv.Atoi(parts[0])
+	if err != nil || minutes < 0 {
+		return 0, false
+	}
+	secFrac := parts[1]
+	secParts := strings.SplitN(secFrac, ".", 2)
+	seconds, err := strconv.Atoi(secParts[0])
+	if err != nil || seconds < 0 {
+		return 0, false
+	}
+	ms := 0
+	if len(secParts) == 2 {
+		frac := secParts[1]
+		if len(frac) > 3 {
+			frac = frac[:3]
+		}
+		for len(frac) < 3 {
+			frac += "0"
+		}
+		parsed, err := strconv.Atoi(frac)
+		if err == nil && parsed >= 0 {
+			ms = parsed
+		}
+	}
+	total := int64(minutes*60*1000 + seconds*1000 + ms)
+	return total, true
+}
+
+func getFirstMapFromArray(m map[string]any, key string) map[string]any {
+	if m == nil {
+		return nil
+	}
+	arr, ok := m[key].([]any)
+	if !ok || len(arr) == 0 {
+		return nil
+	}
+	first, _ := arr[0].(map[string]any)
+	return first
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func candidateQualities(preferred string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, 5)
+	add := func(v string) {
+		v = strings.TrimSpace(v)
+		if _, ok := seen[v]; ok {
+			return
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	add(preferred)
+	add("")
+	add("HIGH")
+	add("LOSSLESS")
+	add("LOW")
+	return out
+}
+
+func isRetryableProviderStatus(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, provider.ErrNotFound) {
+		return true
+	}
+	var statusErr providerStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	switch statusErr.statusCode {
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
+		return true
+	default:
+		return false
+	}
+}
+
+func joinPath(base string, parts ...string) string {
+	s := strings.TrimRight(base, "/")
+	for _, p := range parts {
+		s += "/" + strings.Trim(p, "/")
+	}
+	return s
+}
+
+func windowTracks(in []model.Track, limit int, offset int) []model.Track {
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = len(in)
+	}
+	if offset >= len(in) {
+		return []model.Track{}
+	}
+	end := offset + limit
+	if end > len(in) {
+		end = len(in)
+	}
+	return in[offset:end]
+}
+
+func normalizeImageRef(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return ""
+	}
+	if strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://") {
+		return v
+	}
+	// Tidal-style cover IDs are UUID-like tokens and need conversion to a resources URL.
+	if strings.Count(v, "-") == 4 {
+		return "https://resources.tidal.com/images/" + strings.ReplaceAll(v, "-", "/") + "/750x750.jpg"
+	}
+	return v
+}
+
+func mergeTrackFields(base model.Track, fallback model.Track) model.Track {
+	out := base
+	if out.ID == "" {
+		out.ID = fallback.ID
+	}
+	if out.Provider == "" {
+		out.Provider = fallback.Provider
+	}
+	if out.ProviderID == "" {
+		out.ProviderID = fallback.ProviderID
+	}
+	if out.ProviderRawID == "" {
+		out.ProviderRawID = fallback.ProviderRawID
+	}
+	if out.Title == "" {
+		out.Title = fallback.Title
+	}
+	if out.Artist == "" {
+		out.Artist = fallback.Artist
+	}
+	if out.DisplayArtist == "" {
+		out.DisplayArtist = fallback.DisplayArtist
+	}
+	if len(out.Artists) == 0 {
+		out.Artists = fallback.Artists
+	}
+	if out.Album == "" {
+		out.Album = fallback.Album
+	}
+	if out.ArtistID == "" {
+		out.ArtistID = fallback.ArtistID
+	}
+	if out.AlbumID == "" {
+		out.AlbumID = fallback.AlbumID
+	}
+	if out.Genre == "" {
+		out.Genre = fallback.Genre
+	}
+	if out.DurationSec == 0 {
+		out.DurationSec = fallback.DurationSec
+	}
+	if out.TrackNumber == 0 {
+		out.TrackNumber = fallback.TrackNumber
+	}
+	if out.DiscNumber == 0 {
+		out.DiscNumber = fallback.DiscNumber
+	}
+	if out.BitRate == 0 {
+		out.BitRate = fallback.BitRate
+	}
+	if out.ContentType == "" {
+		out.ContentType = fallback.ContentType
+	}
+	if out.CoverArtURL == "" {
+		out.CoverArtURL = fallback.CoverArtURL
+	}
+	return out
+}
+
+func extractTrackArtists(m map[string]any) []model.TrackArtist {
+	raw, ok := m["artists"]
+	if !ok || raw == nil {
+		return nil
+	}
+	arr, ok := raw.([]any)
+	if !ok || len(arr) == 0 {
+		return nil
+	}
+	out := make([]model.TrackArtist, 0, len(arr))
+	seen := map[string]struct{}{}
+	for _, item := range arr {
+		a := model.TrackArtist{}
+		switch t := item.(type) {
+		case map[string]any:
+			a.Name = firstNonEmpty(getString(t, "name"), getString(t, "artist"), getString(t, "artistName"))
+			a.ID = firstNonEmpty(getString(t, "id"), getString(t, "artistId"), getString(t, "artist_id"))
+		case string:
+			a.Name = strings.TrimSpace(t)
+		}
+		a.Name = strings.TrimSpace(a.Name)
+		a.ID = strings.TrimSpace(a.ID)
+		if a.Name == "" && a.ID == "" {
+			continue
+		}
+		key := strings.ToLower(a.Name + "|" + a.ID)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, a)
+	}
+	return out
+}
+
+func formatDisplayArtistNames(artists []model.TrackArtist) string {
+	names := make([]string, 0, len(artists))
+	for _, a := range artists {
+		if strings.TrimSpace(a.Name) != "" {
+			names = append(names, strings.TrimSpace(a.Name))
+		}
+	}
+	switch len(names) {
+	case 0:
+		return ""
+	case 1:
+		return names[0]
+	case 2:
+		return names[0] + " & " + names[1]
+	default:
+		return strings.Join(names[:len(names)-1], ", ") + " & " + names[len(names)-1]
+	}
+}
