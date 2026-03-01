@@ -1,0 +1,220 @@
+package service
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"dhwani/internal/db"
+	"dhwani/internal/model"
+	"dhwani/internal/provider"
+)
+
+type CatalogService struct {
+	registry               *provider.Registry
+	store                  *db.Store
+	logger                 *slog.Logger
+	recentMu               sync.RWMutex
+	recent                 map[string]recentTrack
+	statsMu                sync.RWMutex
+	stats                  map[string]providerStats
+	providerAttemptTimeout time.Duration
+	maxProviderAttempts    int
+}
+
+type recentTrack struct {
+	Track  model.Track
+	SeenAt time.Time
+}
+
+type providerStats struct {
+	AvgLatency time.Duration
+	Successes  int
+	Failures   int
+	LastSeen   time.Time
+}
+
+func NewCatalogService(registry *provider.Registry, store *db.Store, logger *slog.Logger) *CatalogService {
+	return &CatalogService{
+		registry:               registry,
+		store:                  store,
+		logger:                 logger,
+		recent:                 map[string]recentTrack{},
+		stats:                  map[string]providerStats{},
+		providerAttemptTimeout: 6 * time.Second,
+		maxProviderAttempts:    2,
+	}
+}
+
+func (s *CatalogService) SetProviderAttemptTimeout(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	if d > 30*time.Second {
+		d = 30 * time.Second
+	}
+	s.providerAttemptTimeout = d
+}
+
+func (s *CatalogService) SetMaxProviderAttempts(n int) {
+	if n <= 0 {
+		return
+	}
+	if n > 5 {
+		n = 5
+	}
+	s.maxProviderAttempts = n
+}
+
+func (s *CatalogService) StartLatencyProber(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 3 * time.Hour
+	}
+	go func() {
+		// Prime scores quickly after boot.
+		s.probeProviders(ctx)
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				s.probeProviders(ctx)
+			}
+		}
+	}()
+}
+
+func (s *CatalogService) probeProviders(ctx context.Context) {
+	for _, p := range s.registry.Enabled() {
+		callCtx, cancel := s.providerCallCtx(ctx)
+		start := time.Now()
+		_, err := p.Search(callCtx, "a", 1)
+		cancel()
+		s.recordProviderResult(p.Name(), time.Since(start), err == nil)
+		if err != nil {
+			s.logger.Debug("provider latency probe failed", "provider", p.Name(), "err", err)
+		}
+	}
+}
+
+func (s *CatalogService) SingleProviderName() (string, bool) {
+	enabled := s.registry.Enabled()
+	if len(enabled) != 1 {
+		return "", false
+	}
+	return enabled[0].Name(), true
+}
+
+func (s *CatalogService) Search(ctx context.Context, query string, limit int) (model.SearchResult, error) {
+	lastErr := error(nil)
+	for _, p := range s.topCandidates(s.rankProviders(s.registry.Enabled())) {
+		callCtx, cancel := s.providerCallCtx(ctx)
+		start := time.Now()
+		res, err := p.Search(callCtx, query, limit)
+		cancel()
+		s.recordProviderResult(p.Name(), time.Since(start), err == nil)
+		if err != nil {
+			s.logger.Warn("provider search failed", "provider", p.Name(), "err", err)
+			lastErr = err
+			continue
+		}
+		// Instances are mirrors; use first healthy result and fallback only on failure.
+		dedupeSort(&res)
+		return res, nil
+	}
+	if lastErr != nil {
+		return model.SearchResult{}, lastErr
+	}
+	return model.SearchResult{}, nil
+}
+
+func (s *CatalogService) GetTrack(ctx context.Context, id string) (model.Track, error) {
+	rawID, candidates, _, err := s.providerCandidates(id)
+	if err != nil {
+		return model.Track{}, err
+	}
+	lastErr := error(nil)
+	var best model.Track
+	bestScore := -1
+	for _, p := range s.topCandidates(candidates) {
+		callCtx, cancel := s.providerCallCtx(ctx)
+		start := time.Now()
+		track, err := p.GetTrack(callCtx, rawID)
+		cancel()
+		s.recordProviderResult(p.Name(), time.Since(start), err == nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if s.store != nil && (track.Title == "" || track.Artist == "" || track.Album == "") {
+			cached, cErr := s.store.GetTrackMetadata(ctx, p.Name(), rawID)
+			if cErr == nil {
+				track = mergeTrackMetadata(track, cached)
+			}
+		}
+		if strings.TrimSpace(track.Provider) == "" {
+			track.Provider = p.Name()
+		}
+		if strings.TrimSpace(track.ProviderID) == "" {
+			track.ProviderID = rawID
+		}
+		if strings.TrimSpace(track.ID) == "" {
+			track.ID = rawID
+		}
+		score := trackMetadataScore(track)
+		if score > bestScore {
+			best = track
+			bestScore = score
+		}
+		// Stop early if we have a high-quality track payload.
+		if trackHasEssentialMetadata(track) {
+			return track, nil
+		}
+	}
+	if bestScore >= 0 {
+		return best, nil
+	}
+	if lastErr == nil {
+		lastErr = provider.ErrNotFound
+	}
+	return model.Track{}, lastErr
+}
+
+func (s *CatalogService) GetAlbum(ctx context.Context, id string) (model.Album, error) {
+	rawID, candidates, _, err := s.providerCandidates(id)
+	if err != nil {
+		return model.Album{}, err
+	}
+	lastErr := error(nil)
+	for _, p := range s.topCandidates(candidates) {
+		callCtx, cancel := s.providerCallCtx(ctx)
+		start := time.Now()
+		album, err := p.GetAlbum(callCtx, rawID)
+		cancel()
+		s.recordProviderResult(p.Name(), time.Since(start), err == nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return album, nil
+	}
+	if lastErr == nil {
+		lastErr = provider.ErrNotFound
+	}
+	return model.Album{}, lastErr
+}
+
+func (s *CatalogService) GetArtist(ctx context.Context, id string) (model.Artist, error) {
+	rawID, candidates, _, err := s.providerCandidates(id)
+	if err != nil {
+		return model.Artist{}, err
+	}
+	lastErr := error(nil)
