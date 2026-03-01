@@ -878,3 +878,126 @@ LIMIT ? OFFSET ?
 		return nil, err
 	}
 	defer rows.Close()
+	out := make([]model.Album, 0)
+	for rows.Next() {
+		var a model.Album
+		if err := rows.Scan(
+			&a.ID, &a.Provider, &a.ProviderID, &a.ArtistID, &a.Artist, &a.Name,
+			&a.SongCount, &a.DurationSec, &a.Year, &a.CoverArtURL,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListStarredArtists(ctx context.Context, limit int, offset int) ([]model.Artist, error) {
+	if s == nil || s.DB == nil {
+		return nil, sql.ErrNoRows
+	}
+	if limit <= 0 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+SELECT
+  s.provider_item_id,
+  COALESCE(a.provider, s.provider),
+  COALESCE(a.provider_id, s.provider_item_id),
+  COALESCE(a.name, ''),
+  COALESCE(a.cover_art_url, '')
+FROM starred_items s
+LEFT JOIN artist_metadata a
+  ON a.provider = s.provider AND a.provider_id = s.provider_item_id
+WHERE s.item_type = 'artist'
+ORDER BY s.starred_at DESC
+LIMIT ? OFFSET ?
+`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]model.Artist, 0)
+	for rows.Next() {
+		var a model.Artist
+		if err := rows.Scan(&a.ID, &a.Provider, &a.ProviderID, &a.Name, &a.CoverArtURL); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func scanTracks(rows *sql.Rows) ([]model.Track, error) {
+	out := make([]model.Track, 0)
+	for rows.Next() {
+		var t model.Track
+		if err := rows.Scan(
+			&t.ID,
+			&t.Provider,
+			&t.ProviderID,
+			&t.Title,
+			&t.Artist,
+			&t.DisplayArtist,
+			&t.Album,
+			&t.Genre,
+			&t.ArtistID,
+			&t.AlbumID,
+			&t.DurationSec,
+			&t.TrackNumber,
+			&t.DiscNumber,
+			&t.BitRate,
+			&t.ContentType,
+			&t.CoverArtURL,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func ensureSchemaColumns(db *sql.DB) error {
+	cols := map[string]bool{}
+	rows, err := db.Query(`PRAGMA table_info(track_metadata)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name string
+		var ctype string
+		var notnull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		cols[name] = true
+	}
+	if !cols["genre"] {
+		if _, err := db.Exec(`ALTER TABLE track_metadata ADD COLUMN genre TEXT`); err != nil {
+			return err
+		}
+	}
+	if !cols["artist_id"] {
+		if _, err := db.Exec(`ALTER TABLE track_metadata ADD COLUMN artist_id TEXT`); err != nil {
+			return err
+		}
+	}
+	if !cols["display_artist"] {
+		if _, err := db.Exec(`ALTER TABLE track_metadata ADD COLUMN display_artist TEXT`); err != nil {
+			return err
+		}
+	}
+	if !cols["album_id"] {
+		if _, err := db.Exec(`ALTER TABLE track_metadata ADD COLUMN album_id TEXT`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
