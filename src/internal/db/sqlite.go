@@ -438,3 +438,223 @@ LIMIT ? OFFSET ?
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
+	out := make([]model.Album, 0)
+	for rows.Next() {
+		var a model.Album
+		if err := rows.Scan(&a.ID, &a.Name, &a.ArtistID, &a.Artist, &a.SongCount, &a.DurationSec); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetCachedAlbum(ctx context.Context, albumID string) (model.Album, error) {
+	if s == nil || s.DB == nil {
+		return model.Album{}, sql.ErrNoRows
+	}
+	row := s.DB.QueryRowContext(ctx, `
+SELECT album_id, album, artist_id, artist, COUNT(*) as song_count, COALESCE(SUM(duration_sec), 0) as duration_sec
+FROM track_metadata
+WHERE album_id = ?
+GROUP BY album_id, album, artist_id, artist
+`, albumID)
+	var a model.Album
+	if err := row.Scan(&a.ID, &a.Name, &a.ArtistID, &a.Artist, &a.SongCount, &a.DurationSec); err != nil {
+		return model.Album{}, err
+	}
+	return a, nil
+}
+
+func (s *Store) GetCachedAlbumAny(ctx context.Context, id string) (model.Album, error) {
+	if s == nil || s.DB == nil {
+		return model.Album{}, sql.ErrNoRows
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return model.Album{}, sql.ErrNoRows
+	}
+	row := s.DB.QueryRowContext(ctx, `
+SELECT album_id, album, artist_id, artist, COUNT(*) as song_count, COALESCE(SUM(duration_sec), 0) as duration_sec
+FROM track_metadata
+WHERE album_id = ?
+GROUP BY album_id, album, artist_id, artist
+ORDER BY MAX(updated_at) DESC
+LIMIT 1
+`, id)
+	var a model.Album
+	if err := row.Scan(&a.ID, &a.Name, &a.ArtistID, &a.Artist, &a.SongCount, &a.DurationSec); err != nil {
+		return model.Album{}, err
+	}
+	return a, nil
+}
+
+func (s *Store) GetCachedArtist(ctx context.Context, artistID string) (model.Artist, error) {
+	if s == nil || s.DB == nil {
+		return model.Artist{}, sql.ErrNoRows
+	}
+	row := s.DB.QueryRowContext(ctx, `
+SELECT artist_id, artist
+FROM track_metadata
+WHERE artist_id = ?
+LIMIT 1
+`, artistID)
+	var a model.Artist
+	if err := row.Scan(&a.ID, &a.Name); err != nil {
+		return model.Artist{}, err
+	}
+	return a, nil
+}
+
+func (s *Store) GetCachedArtistAny(ctx context.Context, id string) (model.Artist, error) {
+	if s == nil || s.DB == nil {
+		return model.Artist{}, sql.ErrNoRows
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return model.Artist{}, sql.ErrNoRows
+	}
+	row := s.DB.QueryRowContext(ctx, `
+SELECT artist_id, artist
+FROM track_metadata
+WHERE artist_id = ?
+ORDER BY updated_at DESC
+LIMIT 1
+`, id)
+	var a model.Artist
+	if err := row.Scan(&a.ID, &a.Name); err != nil {
+		return model.Artist{}, err
+	}
+	return a, nil
+}
+
+func (s *Store) ListCachedTracks(ctx context.Context, limit int, offset int) ([]model.Track, error) {
+	if s == nil || s.DB == nil {
+		return nil, sql.ErrNoRows
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+SELECT provider_id, provider, provider_id, COALESCE(title, ''), COALESCE(artist, ''), COALESCE(display_artist, ''), COALESCE(album, ''), COALESCE(genre, ''), COALESCE(artist_id, ''), COALESCE(album_id, ''),
+       duration_sec, track_number, disc_number, bit_rate, COALESCE(content_type, ''), COALESCE(cover_art_url, '')
+FROM track_metadata
+WHERE provider_id != ''
+  AND COALESCE(title, '') != ''
+  AND COALESCE(artist, '') != ''
+  AND COALESCE(album, '') != ''
+ORDER BY rowid DESC
+LIMIT ? OFFSET ?
+`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanTracks(rows)
+}
+
+func (s *Store) ListCachedTracksByAlbum(ctx context.Context, albumID string, limit int, offset int) ([]model.Track, error) {
+	if s == nil || s.DB == nil {
+		return nil, sql.ErrNoRows
+	}
+	if limit <= 0 {
+		limit = 500
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+SELECT provider_id, provider, provider_id, COALESCE(title, ''), COALESCE(artist, ''), COALESCE(display_artist, ''), COALESCE(album, ''), COALESCE(genre, ''), COALESCE(artist_id, ''), COALESCE(album_id, ''),
+       duration_sec, track_number, disc_number, bit_rate, COALESCE(content_type, ''), COALESCE(cover_art_url, '')
+FROM track_metadata
+WHERE album_id = ?
+  AND COALESCE(title, '') != ''
+ORDER BY disc_number, track_number, title
+LIMIT ? OFFSET ?
+`, albumID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanTracks(rows)
+}
+
+func (s *Store) ListCachedTracksByArtist(ctx context.Context, artistID string, limit int, offset int) ([]model.Track, error) {
+	if s == nil || s.DB == nil {
+		return nil, sql.ErrNoRows
+	}
+	if limit <= 0 {
+		limit = 500
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+SELECT provider_id, provider, provider_id, COALESCE(title, ''), COALESCE(artist, ''), COALESCE(display_artist, ''), COALESCE(album, ''), COALESCE(genre, ''), COALESCE(artist_id, ''), COALESCE(album_id, ''),
+       duration_sec, track_number, disc_number, bit_rate, COALESCE(content_type, ''), COALESCE(cover_art_url, '')
+FROM track_metadata
+WHERE artist_id = ?
+  AND COALESCE(title, '') != ''
+ORDER BY album, disc_number, track_number, title
+LIMIT ? OFFSET ?
+`, artistID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanTracks(rows)
+}
+
+func (s *Store) ListCachedTracksByGenre(ctx context.Context, genre string, limit int, offset int) ([]model.Track, error) {
+	if s == nil || s.DB == nil {
+		return nil, sql.ErrNoRows
+	}
+	if limit <= 0 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+SELECT provider_id, provider, provider_id, COALESCE(title, ''), COALESCE(artist, ''), COALESCE(display_artist, ''), COALESCE(album, ''), COALESCE(genre, ''), COALESCE(artist_id, ''), COALESCE(album_id, ''),
+       duration_sec, track_number, disc_number, bit_rate, COALESCE(content_type, ''), COALESCE(cover_art_url, '')
+FROM track_metadata
+WHERE lower(genre) = lower(?) AND provider_id != ''
+  AND COALESCE(title, '') != ''
+  AND COALESCE(artist, '') != ''
+  AND COALESCE(album, '') != ''
+ORDER BY rowid DESC
+LIMIT ? OFFSET ?
+`, genre, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanTracks(rows)
+}
+
+func (s *Store) RandomCachedTracks(ctx context.Context, limit int) ([]model.Track, error) {
+	if s == nil || s.DB == nil {
+		return nil, sql.ErrNoRows
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+SELECT provider_id, provider, provider_id, COALESCE(title, ''), COALESCE(artist, ''), COALESCE(display_artist, ''), COALESCE(album, ''), COALESCE(genre, ''), COALESCE(artist_id, ''), COALESCE(album_id, ''),
+       duration_sec, track_number, disc_number, bit_rate, COALESCE(content_type, ''), COALESCE(cover_art_url, '')
+FROM track_metadata
+WHERE provider_id != ''
+  AND COALESCE(title, '') != ''
+  AND COALESCE(artist, '') != ''
+  AND COALESCE(album, '') != ''
+ORDER BY RANDOM()
+LIMIT ?
+`, limit)
+	if err != nil {
+		return nil, err
+	}
