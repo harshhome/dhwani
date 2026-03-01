@@ -658,3 +658,223 @@ LIMIT ?
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
+	return scanTracks(rows)
+}
+
+func (s *Store) ListCachedGenres(ctx context.Context, limit int) ([]string, error) {
+	if s == nil || s.DB == nil {
+		return nil, sql.ErrNoRows
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+SELECT DISTINCT genre
+FROM track_metadata
+WHERE genre != ''
+ORDER BY genre
+LIMIT ?
+`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]string, 0)
+	for rows.Next() {
+		var g string
+		if err := rows.Scan(&g); err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteTrackByAnyID(ctx context.Context, id string) error {
+	if s == nil || s.DB == nil {
+		return nil
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if _, err = tx.ExecContext(ctx, `
+DELETE FROM track_metadata
+WHERE provider_id = ?
+`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) DeleteAlbumByAnyID(ctx context.Context, id string) error {
+	if s == nil || s.DB == nil {
+		return nil
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM track_metadata WHERE album_id = ?`, id); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM album_metadata WHERE provider_id = ?`, id); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) DeleteArtistByAnyID(ctx context.Context, id string) error {
+	if s == nil || s.DB == nil {
+		return nil
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM track_metadata WHERE artist_id = ?`, id); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM album_metadata WHERE artist_id = ?`, id); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM artist_metadata WHERE provider_id = ?`, id); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) StarItem(ctx context.Context, itemType string, provider string, providerItemID string) error {
+	if s == nil || s.DB == nil {
+		return nil
+	}
+	itemType = strings.TrimSpace(strings.ToLower(itemType))
+	provider = strings.TrimSpace(provider)
+	providerItemID = strings.TrimSpace(providerItemID)
+	if itemType == "" || provider == "" || providerItemID == "" {
+		return nil
+	}
+	_, err := s.DB.ExecContext(ctx, `
+INSERT INTO starred_items (item_type, provider, provider_item_id, starred_at)
+VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+ON CONFLICT(item_type, provider, provider_item_id) DO UPDATE SET
+  starred_at = CURRENT_TIMESTAMP
+`, itemType, provider, providerItemID)
+	return err
+}
+
+func (s *Store) UnstarItemByAnyID(ctx context.Context, itemType string, providerItemID string) error {
+	if s == nil || s.DB == nil {
+		return nil
+	}
+	itemType = strings.TrimSpace(strings.ToLower(itemType))
+	providerItemID = strings.TrimSpace(providerItemID)
+	if itemType == "" || providerItemID == "" {
+		return nil
+	}
+	_, err := s.DB.ExecContext(ctx, `
+DELETE FROM starred_items
+WHERE item_type = ? AND provider_item_id = ?
+`, itemType, providerItemID)
+	return err
+}
+
+func (s *Store) ListStarredTracks(ctx context.Context, limit int, offset int) ([]model.Track, error) {
+	if s == nil || s.DB == nil {
+		return nil, sql.ErrNoRows
+	}
+	if limit <= 0 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+SELECT
+  s.provider_item_id,
+  COALESCE(t.provider, s.provider),
+  COALESCE(t.provider_id, s.provider_item_id),
+  COALESCE(t.title, ''),
+  COALESCE(t.artist, ''),
+  COALESCE(t.display_artist, ''),
+  COALESCE(t.album, ''),
+  COALESCE(t.genre, ''),
+  COALESCE(t.artist_id, ''),
+  COALESCE(t.album_id, ''),
+  COALESCE(t.duration_sec, 0),
+  COALESCE(t.track_number, 0),
+  COALESCE(t.disc_number, 0),
+  COALESCE(t.bit_rate, 0),
+  COALESCE(t.content_type, ''),
+  COALESCE(t.cover_art_url, '')
+FROM starred_items s
+LEFT JOIN track_metadata t
+  ON t.provider = s.provider AND t.provider_id = s.provider_item_id
+WHERE s.item_type = 'track'
+ORDER BY s.starred_at DESC
+LIMIT ? OFFSET ?
+`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanTracks(rows)
+}
+
+func (s *Store) ListStarredAlbums(ctx context.Context, limit int, offset int) ([]model.Album, error) {
+	if s == nil || s.DB == nil {
+		return nil, sql.ErrNoRows
+	}
+	if limit <= 0 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+SELECT
+  s.provider_item_id,
+  COALESCE(a.provider, s.provider),
+  COALESCE(a.provider_id, s.provider_item_id),
+  COALESCE(a.artist_id, ''),
+  COALESCE(a.artist, ''),
+  COALESCE(a.name, ''),
+  COALESCE(a.song_count, 0),
+  COALESCE(a.duration_sec, 0),
+  COALESCE(a.year, 0),
+  COALESCE(a.cover_art_url, '')
+FROM starred_items s
+LEFT JOIN album_metadata a
+  ON a.provider_id = s.provider_item_id
+WHERE s.item_type = 'album'
+ORDER BY s.starred_at DESC
+LIMIT ? OFFSET ?
+`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
