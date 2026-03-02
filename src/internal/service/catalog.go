@@ -1098,3 +1098,223 @@ func (s *CatalogService) recentTrack(id string) (model.Track, bool) {
 	if !ok {
 		return model.Track{}, false
 	}
+	if time.Since(rt.SeenAt) > 2*time.Hour {
+		s.recentMu.Lock()
+		delete(s.recent, id)
+		s.recentMu.Unlock()
+		return model.Track{}, false
+	}
+	return rt.Track, true
+}
+
+func (s *CatalogService) recentTrackByRawID(rawID string) (model.Track, bool) {
+	rawID = strings.TrimSpace(rawID)
+	if rawID == "" {
+		return model.Track{}, false
+	}
+	s.recentMu.RLock()
+	defer s.recentMu.RUnlock()
+	for _, rt := range s.recent {
+		if time.Since(rt.SeenAt) > 2*time.Hour {
+			continue
+		}
+		if strings.TrimSpace(rt.Track.ProviderID) == rawID {
+			return rt.Track, true
+		}
+		if strings.TrimSpace(rt.Track.ID) == rawID {
+			return rt.Track, true
+		}
+	}
+	return model.Track{}, false
+}
+
+func (s *CatalogService) coverArtFromRecent(id string) string {
+	raw := rawIDOrSelf(id)
+	s.recentMu.RLock()
+	defer s.recentMu.RUnlock()
+	for _, rt := range s.recent {
+		if time.Since(rt.SeenAt) > 2*time.Hour {
+			continue
+		}
+		t := rt.Track
+		if strings.TrimSpace(t.CoverArtURL) == "" {
+			continue
+		}
+		if strings.TrimSpace(t.ID) == id || strings.TrimSpace(t.ProviderID) == id ||
+			strings.TrimSpace(t.AlbumID) == id || strings.TrimSpace(t.ArtistID) == id {
+			return t.CoverArtURL
+		}
+		if rawIDOrSelf(t.ID) == raw || rawIDOrSelf(t.ProviderID) == raw ||
+			rawIDOrSelf(t.AlbumID) == raw || rawIDOrSelf(t.ArtistID) == raw {
+			return t.CoverArtURL
+		}
+	}
+	return ""
+}
+
+func rawIDOrSelf(id string) string {
+	return strings.TrimSpace(id)
+}
+
+func trackHasEssentialMetadata(t model.Track) bool {
+	return strings.TrimSpace(t.Title) != "" &&
+		strings.TrimSpace(t.Artist) != "" &&
+		strings.TrimSpace(t.Album) != ""
+}
+
+func trackMetadataScore(t model.Track) int {
+	score := 0
+	if strings.TrimSpace(t.Title) != "" {
+		score++
+	}
+	if strings.TrimSpace(t.Artist) != "" {
+		score++
+	}
+	if strings.TrimSpace(t.Album) != "" {
+		score++
+	}
+	if strings.TrimSpace(t.ArtistID) != "" {
+		score++
+	}
+	if strings.TrimSpace(t.AlbumID) != "" {
+		score++
+	}
+	if strings.TrimSpace(t.CoverArtURL) != "" {
+		score++
+	}
+	return score
+}
+
+func (s *CatalogService) hydrateTrackFromProviderSearch(ctx context.Context, rawID string, preferred string, candidates []provider.Provider) (model.Track, bool) {
+	for _, p := range s.topCandidates(candidates) {
+		callCtx, cancel := s.providerCallCtx(ctx)
+		start := time.Now()
+		res, err := p.Search(callCtx, rawID, 50)
+		cancel()
+		s.recordProviderResult(p.Name(), time.Since(start), err == nil)
+		if err != nil {
+			continue
+		}
+		for _, t := range res.Tracks {
+			if strings.TrimSpace(t.ProviderID) != rawID {
+				continue
+			}
+			if strings.TrimSpace(t.Provider) == "" {
+				t.Provider = p.Name()
+			}
+			if strings.TrimSpace(t.ProviderID) == "" {
+				t.ProviderID = rawID
+			}
+			if strings.TrimSpace(t.ID) == "" {
+				t.ID = rawID
+			}
+			if trackHasEssentialMetadata(t) {
+				return t, true
+			}
+		}
+	}
+	return model.Track{}, false
+}
+
+func (s *CatalogService) topCandidates(cands []provider.Provider) []provider.Provider {
+	if len(cands) == 0 {
+		return cands
+	}
+	if s.maxProviderAttempts <= 0 || len(cands) <= s.maxProviderAttempts {
+		return cands
+	}
+	return cands[:s.maxProviderAttempts]
+}
+
+func (s *CatalogService) providerCallCtx(parent context.Context) (context.Context, context.CancelFunc) {
+	timeout := s.providerAttemptTimeout
+	if timeout <= 0 {
+		timeout = 6 * time.Second
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
+func (s *CatalogService) recordProviderResult(name string, latency time.Duration, ok bool) {
+	if strings.TrimSpace(name) == "" {
+		return
+	}
+	now := time.Now().UTC()
+	s.statsMu.Lock()
+	defer s.statsMu.Unlock()
+	st := s.stats[name]
+	if latency < 0 {
+		latency = 0
+	}
+	if ok {
+		st.Successes++
+		// EWMA-ish smoothing to avoid jitter thrashing.
+		if st.AvgLatency == 0 {
+			st.AvgLatency = latency
+		} else {
+			st.AvgLatency = time.Duration((float64(st.AvgLatency) * 0.7) + (float64(latency) * 0.3))
+		}
+	} else {
+		st.Failures++
+		// Penalize failures so unstable providers are deprioritized quickly.
+		if st.AvgLatency == 0 {
+			st.AvgLatency = 5 * time.Second
+		} else {
+			st.AvgLatency += 1500 * time.Millisecond
+		}
+	}
+	st.LastSeen = now
+	s.stats[name] = st
+}
+
+func (s *CatalogService) rankProviders(in []provider.Provider) []provider.Provider {
+	if len(in) <= 1 {
+		return in
+	}
+	s.statsMu.RLock()
+	stats := make(map[string]providerStats, len(s.stats))
+	for k, v := range s.stats {
+		stats[k] = v
+	}
+	s.statsMu.RUnlock()
+
+	out := append([]provider.Provider(nil), in...)
+	sort.SliceStable(out, func(i, j int) bool {
+		si := stats[out[i].Name()]
+		sj := stats[out[j].Name()]
+		ri := providerRankScore(si)
+		rj := providerRankScore(sj)
+		if ri == rj {
+			return out[i].Name() < out[j].Name()
+		}
+		return ri < rj
+	})
+	return out
+}
+
+func providerRankScore(st providerStats) float64 {
+	if st.Successes == 0 && st.Failures == 0 {
+		return 10000 // unknown providers after already-probed ones
+	}
+	latMs := float64(st.AvgLatency.Milliseconds())
+	if latMs <= 0 {
+		latMs = 1
+	}
+	failPenalty := float64(st.Failures-st.Successes) * 400
+	if failPenalty < 0 {
+		failPenalty = 0
+	}
+	return latMs + failPenalty
+}
+
+func (s *CatalogService) deriveArtistsFromTracks(ctx context.Context, limit int) ([]model.Artist, error) {
+	if s.store == nil {
+		return []model.Artist{}, nil
+	}
+	if limit <= 0 {
+		limit = 1000
+	}
+	tracks, err := s.store.ListCachedTracks(ctx, limit*20, 0)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return []model.Artist{}, nil
+		}
