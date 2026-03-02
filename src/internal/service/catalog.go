@@ -878,3 +878,223 @@ func (s *CatalogService) IngestStarredTrack(ctx context.Context, id string) erro
 		return s.persistTrackSet(ctx, []model.Track{t})
 	}
 	if t, ok := s.hydrateTrackFromProviderSearch(ctx, rawID, preferred, candidates); ok {
+		s.RememberTracks([]model.Track{t})
+		return s.persistTrackSet(ctx, []model.Track{t})
+	}
+	track, err := s.GetTrack(ctx, rawID)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(track.ID) == "" {
+		track.ID = rawID
+	}
+	if strings.TrimSpace(track.Provider) == "" {
+		track.Provider = preferred
+	}
+	if strings.TrimSpace(track.ProviderID) == "" {
+		track.ProviderID = rawID
+	}
+	if !trackHasEssentialMetadata(track) {
+		return fmt.Errorf("insufficient track metadata for %s", rawID)
+	}
+	s.RememberTracks([]model.Track{track})
+	return s.persistTrackSet(ctx, []model.Track{track})
+}
+
+func (s *CatalogService) IngestStarredAlbum(ctx context.Context, albumID string) error {
+	rawID, _, _, err := s.providerCandidates(albumID)
+	if err != nil {
+		return err
+	}
+	tracks, err := s.GetAlbumTracksLive(ctx, rawID, 2000, 0)
+	if err != nil {
+		return err
+	}
+	if len(tracks) == 0 {
+		return provider.ErrNotFound
+	}
+	s.RememberTracks(tracks)
+	return s.persistTrackSet(ctx, tracks)
+}
+
+func (s *CatalogService) IngestStarredArtist(ctx context.Context, artistID string) error {
+	albums, err := s.GetArtistAlbumsLive(ctx, artistID, 1000, 0)
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, a := range albums {
+		if err := s.IngestStarredAlbum(ctx, a.ID); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (s *CatalogService) UnstarTrack(ctx context.Context, id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" || s.store == nil {
+		return nil
+	}
+	_ = s.store.UnstarItemByAnyID(ctx, "track", id)
+	if err := s.store.DeleteTrackByAnyID(ctx, id); err != nil {
+		return err
+	}
+
+	// Evict from in-memory recent cache.
+	s.recentMu.Lock()
+	for key, rt := range s.recent {
+		if key == id || strings.TrimSpace(rt.Track.ProviderID) == id {
+			delete(s.recent, key)
+		}
+	}
+	s.recentMu.Unlock()
+	return nil
+}
+
+func (s *CatalogService) UnstarAlbum(ctx context.Context, id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" || s.store == nil {
+		return nil
+	}
+	_ = s.store.UnstarItemByAnyID(ctx, "album", id)
+	return s.store.DeleteAlbumByAnyID(ctx, id)
+}
+
+func (s *CatalogService) UnstarArtist(ctx context.Context, id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" || s.store == nil {
+		return nil
+	}
+	_ = s.store.UnstarItemByAnyID(ctx, "artist", id)
+	return s.store.DeleteArtistByAnyID(ctx, id)
+}
+
+func (s *CatalogService) persistTrackSet(ctx context.Context, tracks []model.Track) error {
+	if len(tracks) == 0 || s.store == nil {
+		return nil
+	}
+	firstErr := error(nil)
+	seenAlbums := make(map[string]struct{}, len(tracks))
+	for _, t := range tracks {
+		if strings.TrimSpace(t.Provider) == "" || strings.TrimSpace(t.ProviderID) == "" {
+			continue
+		}
+		if strings.TrimSpace(t.ID) == "" {
+			t.ID = t.ProviderID
+		}
+		if strings.TrimSpace(t.ArtistID) == "" && strings.TrimSpace(t.Artist) != "" {
+			t.ArtistID = "unknown-" + t.ProviderID
+		}
+		if strings.TrimSpace(t.AlbumID) == "" && strings.TrimSpace(t.Album) != "" {
+			t.AlbumID = "unknown-" + t.ProviderID
+		}
+		if strings.TrimSpace(t.AlbumID) != "" {
+			key := t.Provider + "|" + t.AlbumID
+			if _, ok := seenAlbums[key]; !ok {
+				if err := s.ensureAlbumMetadataForTrack(ctx, t); err != nil && firstErr == nil {
+					firstErr = err
+				}
+				seenAlbums[key] = struct{}{}
+			}
+		}
+		if err := s.store.UpsertTrackMetadata(ctx, t); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (s *CatalogService) ensureAlbumMetadataForTrack(ctx context.Context, t model.Track) error {
+	if s.store == nil || strings.TrimSpace(t.Provider) == "" || strings.TrimSpace(t.AlbumID) == "" {
+		return nil
+	}
+	if existing, err := s.store.GetAlbumMetadataAny(ctx, t.AlbumID); err == nil {
+		if existing.Year > 0 && existing.SongCount > 0 && existing.DurationSec > 0 {
+			return nil
+		}
+	}
+
+	album, albErr := s.GetAlbum(ctx, t.AlbumID)
+	if albErr != nil {
+		album = model.Album{
+			ID:          t.AlbumID,
+			Provider:    t.Provider,
+			ProviderID:  t.AlbumID,
+			ArtistID:    t.ArtistID,
+			Artist:      t.Artist,
+			Name:        t.Album,
+			CoverArtURL: t.CoverArtURL,
+		}
+	}
+	if strings.TrimSpace(album.Provider) == "" {
+		album.Provider = t.Provider
+	}
+	if strings.TrimSpace(album.ProviderID) == "" {
+		album.ProviderID = t.AlbumID
+	}
+	if strings.TrimSpace(album.ID) == "" {
+		album.ID = t.AlbumID
+	}
+	if strings.TrimSpace(album.Name) == "" {
+		album.Name = t.Album
+	}
+	if strings.TrimSpace(album.ArtistID) == "" {
+		album.ArtistID = t.ArtistID
+	}
+	if strings.TrimSpace(album.Artist) == "" {
+		album.Artist = t.Artist
+	}
+	if strings.TrimSpace(album.CoverArtURL) == "" {
+		album.CoverArtURL = t.CoverArtURL
+	}
+
+	if tracks, trErr := s.GetAlbumTracksLive(ctx, t.AlbumID, 2000, 0); trErr == nil && len(tracks) > 0 {
+		album.SongCount = len(tracks)
+		total := 0
+		for _, tr := range tracks {
+			total += tr.DurationSec
+		}
+		album.DurationSec = total
+		if strings.TrimSpace(album.ArtistID) == "" {
+			album.ArtistID = tracks[0].ArtistID
+		}
+		if strings.TrimSpace(album.Artist) == "" {
+			album.Artist = tracks[0].Artist
+		}
+		if strings.TrimSpace(album.CoverArtURL) == "" {
+			album.CoverArtURL = tracks[0].CoverArtURL
+		}
+	}
+
+	return s.store.UpsertAlbumMetadata(ctx, album)
+}
+
+func (s *CatalogService) RememberTracks(tracks []model.Track) {
+	if len(tracks) == 0 {
+		return
+	}
+	now := time.Now().UTC()
+	cutoff := now.Add(-2 * time.Hour)
+	s.recentMu.Lock()
+	defer s.recentMu.Unlock()
+	for _, t := range tracks {
+		if strings.TrimSpace(t.ID) == "" {
+			continue
+		}
+		s.recent[t.ID] = recentTrack{Track: t, SeenAt: now}
+	}
+	for id, rt := range s.recent {
+		if rt.SeenAt.Before(cutoff) {
+			delete(s.recent, id)
+		}
+	}
+}
+
+func (s *CatalogService) recentTrack(id string) (model.Track, bool) {
+	s.recentMu.RLock()
+	rt, ok := s.recent[id]
+	s.recentMu.RUnlock()
+	if !ok {
+		return model.Track{}, false
+	}
