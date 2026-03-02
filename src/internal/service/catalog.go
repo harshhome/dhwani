@@ -1318,3 +1318,139 @@ func (s *CatalogService) deriveArtistsFromTracks(ctx context.Context, limit int)
 		if errors.Is(err, sql.ErrNoRows) {
 			return []model.Artist{}, nil
 		}
+		return nil, err
+	}
+	seen := map[string]model.Artist{}
+	for _, t := range tracks {
+		name := strings.TrimSpace(t.Artist)
+		if name == "" {
+			continue
+		}
+		id := strings.TrimSpace(t.ArtistID)
+		if id == "" {
+			raw := strings.ToLower(strings.ReplaceAll(name, " ", "_"))
+			id = raw
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = model.Artist{
+			ID:          id,
+			Provider:    t.Provider,
+			ProviderID:  strings.TrimPrefix(id, t.Provider+"-artist-"),
+			Name:        name,
+			CoverArtURL: t.CoverArtURL,
+		}
+		if len(seen) >= limit {
+			break
+		}
+	}
+	out := make([]model.Artist, 0, len(seen))
+	for _, a := range seen {
+		out = append(out, a)
+	}
+	sort.Slice(out, func(i, j int) bool { return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name) })
+	return out, nil
+}
+
+func mergeTrackMetadata(base, cached model.Track) model.Track {
+	out := base
+	if out.ID == "" {
+		out.ID = cached.ID
+	}
+	if out.Title == "" {
+		out.Title = cached.Title
+	}
+	if out.Artist == "" {
+		out.Artist = cached.Artist
+	}
+	if out.DisplayArtist == "" {
+		out.DisplayArtist = cached.DisplayArtist
+	}
+	if len(out.Artists) == 0 {
+		out.Artists = cached.Artists
+	}
+	if out.Album == "" {
+		out.Album = cached.Album
+	}
+	if out.ArtistID == "" {
+		out.ArtistID = cached.ArtistID
+	}
+	if out.AlbumID == "" {
+		out.AlbumID = cached.AlbumID
+	}
+	if out.DurationSec == 0 {
+		out.DurationSec = cached.DurationSec
+	}
+	if out.TrackNumber == 0 {
+		out.TrackNumber = cached.TrackNumber
+	}
+	if out.DiscNumber == 0 {
+		out.DiscNumber = cached.DiscNumber
+	}
+	if out.BitRate == 0 {
+		out.BitRate = cached.BitRate
+	}
+	if out.ContentType == "" {
+		out.ContentType = cached.ContentType
+	}
+	if out.CoverArtURL == "" {
+		out.CoverArtURL = cached.CoverArtURL
+	}
+	return out
+}
+
+func dedupeSort(sr *model.SearchResult) {
+	sr.Artists = dedupeArtists(sr.Artists)
+	sr.Albums = dedupeAlbums(sr.Albums)
+	sr.Tracks = dedupeTracks(sr.Tracks)
+}
+
+func dedupeArtists(in []model.Artist) []model.Artist {
+	seen := map[string]struct{}{}
+	out := make([]model.Artist, 0, len(in))
+	for _, v := range in {
+		if _, ok := seen[v.ID]; ok {
+			continue
+		}
+		seen[v.ID] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+func dedupeAlbums(in []model.Album) []model.Album {
+	seen := map[string]struct{}{}
+	out := make([]model.Album, 0, len(in))
+	for _, v := range in {
+		if _, ok := seen[v.ID]; ok {
+			continue
+		}
+		seen[v.ID] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+func dedupeTracks(in []model.Track) []model.Track {
+	seen := map[string]struct{}{}
+	out := make([]model.Track, 0, len(in))
+	for _, v := range in {
+		if _, ok := seen[v.ID]; ok {
+			continue
+		}
+		seen[v.ID] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+func IsNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return true
+	}
+	return errors.Is(err, provider.ErrNotFound)
+}
