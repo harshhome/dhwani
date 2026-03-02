@@ -658,3 +658,223 @@ func (s *CatalogService) PersistMappings(ctx context.Context, result model.Searc
 	}
 	for _, t := range result.Tracks {
 		if err := s.store.UpsertTrackMetadata(ctx, t); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			s.logger.Warn("track mapping upsert failed", "provider", t.Provider, "provider_id", t.ProviderID, "err", err)
+		}
+	}
+	return firstErr
+}
+
+func (s *CatalogService) StarTrack(ctx context.Context, id string) error {
+	if s.store == nil {
+		return nil
+	}
+	rawID, _, preferred, err := s.providerCandidates(id)
+	if err != nil {
+		return err
+	}
+	return s.store.StarItem(ctx, "track", preferred, rawID)
+}
+
+func (s *CatalogService) StarAlbum(ctx context.Context, id string) error {
+	if s.store == nil {
+		return nil
+	}
+	rawID, _, preferred, err := s.providerCandidates(id)
+	if err != nil {
+		return err
+	}
+	return s.store.StarItem(ctx, "album", preferred, rawID)
+}
+
+func (s *CatalogService) StarArtist(ctx context.Context, id string) error {
+	if s.store == nil {
+		return nil
+	}
+	rawID, _, preferred, err := s.providerCandidates(id)
+	if err != nil {
+		return err
+	}
+	return s.store.StarItem(ctx, "artist", preferred, rawID)
+}
+
+func (s *CatalogService) ListStarredTracks(ctx context.Context, limit int, offset int) ([]model.Track, error) {
+	if s.store == nil {
+		return []model.Track{}, nil
+	}
+	tracks, err := s.store.ListStarredTracks(ctx, limit, offset)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return []model.Track{}, nil
+		}
+		return nil, err
+	}
+	return tracks, nil
+}
+
+func (s *CatalogService) ListStarredAlbums(ctx context.Context, limit int, offset int) ([]model.Album, error) {
+	if s.store == nil {
+		return []model.Album{}, nil
+	}
+	albums, err := s.store.ListStarredAlbums(ctx, limit, offset)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return []model.Album{}, nil
+		}
+		return nil, err
+	}
+	return albums, nil
+}
+
+func (s *CatalogService) ListStarredArtists(ctx context.Context, limit int, offset int) ([]model.Artist, error) {
+	if s.store == nil {
+		return []model.Artist{}, nil
+	}
+	artists, err := s.store.ListStarredArtists(ctx, limit, offset)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return []model.Artist{}, nil
+		}
+		return nil, err
+	}
+	return artists, nil
+}
+
+func (s *CatalogService) RecordPlayedTrack(ctx context.Context, id string) {
+	if s.store == nil {
+		return
+	}
+	rawID, candidates, preferred, err := s.providerCandidates(id)
+	if err != nil {
+		return
+	}
+	track := model.Track{
+		ID:          rawID,
+		Provider:    preferred,
+		ProviderID:  rawID,
+		Title:       "Track " + rawID,
+		Artist:      "Unknown Artist",
+		Album:       "Unknown Album",
+		ArtistID:    "unknown",
+		AlbumID:     "unknown",
+		ContentType: "audio/flac",
+	}
+	if rt, ok := s.recentTrack(rawID); ok {
+		track = mergeTrackMetadata(rt, track)
+	}
+	for _, p := range s.topCandidates(candidates) {
+		callCtx, cancel := s.providerCallCtx(ctx)
+		start := time.Now()
+		resolved, rErr := p.GetTrack(callCtx, rawID)
+		cancel()
+		s.recordProviderResult(p.Name(), time.Since(start), rErr == nil)
+		if rErr == nil {
+			track = mergeTrackMetadata(resolved, track)
+			if track.Provider == "" {
+				track.Provider = p.Name()
+			}
+			if track.ProviderID == "" {
+				track.ProviderID = rawID
+			}
+			if track.ID == "" {
+				track.ID = rawID
+			}
+			break
+		}
+	}
+	if track.Provider == "" {
+		track.Provider = preferred
+	}
+	if track.ProviderID == "" {
+		track.ProviderID = rawID
+	}
+	if track.ID == "" {
+		track.ID = rawID
+	}
+	// Avoid polluting DB with synthetic placeholders when no real metadata could be resolved.
+	if strings.HasPrefix(track.Title, "Track ") && track.Artist == "Unknown Artist" && track.Album == "Unknown Album" {
+		return
+	}
+
+	artistProviderID := strings.TrimSpace(track.ArtistID)
+	if artistProviderID == "" {
+		artistProviderID = "unknown"
+	}
+	albumProviderID := strings.TrimSpace(track.AlbumID)
+	if albumProviderID == "" {
+		albumProviderID = "unknown"
+	}
+
+	if err := s.PersistMappings(ctx, model.SearchResult{
+		Artists: []model.Artist{{
+			ID:          track.ArtistID,
+			Provider:    track.Provider,
+			ProviderID:  artistProviderID,
+			Name:        track.Artist,
+			CoverArtURL: track.CoverArtURL,
+		}},
+		Albums: []model.Album{{
+			ID:          track.AlbumID,
+			Provider:    track.Provider,
+			ProviderID:  albumProviderID,
+			ArtistID:    track.ArtistID,
+			Artist:      track.Artist,
+			Name:        track.Album,
+			CoverArtURL: track.CoverArtURL,
+		}},
+		Tracks: []model.Track{track},
+	}); err != nil {
+		s.logger.Warn("persist mappings failed during play ingest", "id", rawID, "err", err)
+	}
+}
+
+func (s *CatalogService) IngestStarredTrack(ctx context.Context, id string) error {
+	rawID, candidates, preferred, err := s.providerCandidates(id)
+	if err != nil {
+		return err
+	}
+	if rt, ok := s.recentTrack(rawID); ok {
+		if strings.TrimSpace(rt.ID) == "" {
+			rt.ID = rawID
+		}
+		if strings.TrimSpace(rt.Provider) == "" {
+			rt.Provider = preferred
+		}
+		if strings.TrimSpace(rt.ProviderID) == "" {
+			rt.ProviderID = rawID
+		}
+		if trackHasEssentialMetadata(rt) {
+			return s.persistTrackSet(ctx, []model.Track{rt})
+		}
+	}
+	// If the exact ID was not found in recent cache, try matching by raw track ID
+	// across all providers to reuse richer metadata from recent search results.
+	if rt, ok := s.recentTrackByRawID(rawID); ok {
+		if strings.TrimSpace(rt.ID) == "" {
+			rt.ID = rawID
+		}
+		if strings.TrimSpace(rt.Provider) == "" {
+			rt.Provider = preferred
+		}
+		if strings.TrimSpace(rt.ProviderID) == "" {
+			rt.ProviderID = rawID
+		}
+		if trackHasEssentialMetadata(rt) {
+			return s.persistTrackSet(ctx, []model.Track{rt})
+		}
+	}
+	if t, err := s.GetCachedTrackAny(ctx, rawID); err == nil && trackHasEssentialMetadata(t) {
+		if strings.TrimSpace(t.ID) == "" {
+			t.ID = rawID
+		}
+		if strings.TrimSpace(t.ProviderID) == "" {
+			t.ProviderID = rawID
+		}
+		if strings.TrimSpace(t.Provider) == "" {
+			t.Provider = preferred
+		}
+		return s.persistTrackSet(ctx, []model.Track{t})
+	}
+	if t, ok := s.hydrateTrackFromProviderSearch(ctx, rawID, preferred, candidates); ok {
