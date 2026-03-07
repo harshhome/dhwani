@@ -218,3 +218,164 @@ func (s *Server) probeContentLength(ctx context.Context, target string) (int64, 
 		return 0, err
 	}
 	resp, err := s.httpClient.Do(req)
+	if err == nil {
+		resp.Body.Close()
+		if resp.StatusCode < 400 {
+			if n, err := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64); err == nil && n > 0 {
+				return n, nil
+			}
+		}
+	}
+
+	req, err = http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Range", "bytes=0-0")
+	resp, err = s.httpClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return 0, fmt.Errorf("segment probe status %d", resp.StatusCode)
+	}
+	if cr := resp.Header.Get("Content-Range"); cr != "" {
+		total, err := parseContentRangeTotal(cr)
+		if err == nil && total > 0 {
+			return total, nil
+		}
+	}
+	if n, err := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64); err == nil && n > 0 {
+		if resp.StatusCode == http.StatusPartialContent {
+			return n, nil
+		}
+		return n, nil
+	}
+	return 0, fmt.Errorf("unable to probe segment length")
+}
+
+func parseContentRangeTotal(v string) (int64, error) {
+	// Format: bytes 0-0/12345
+	parts := strings.Split(strings.TrimSpace(v), "/")
+	if len(parts) != 2 {
+		return 0, fmt.Errorf("invalid content-range")
+	}
+	if parts[1] == "*" {
+		return 0, fmt.Errorf("unknown content-range total")
+	}
+	return strconv.ParseInt(parts[1], 10, 64)
+}
+
+func parseStreamRange(rangeHeader string, total int64) (int64, int64, bool, error) {
+	if strings.TrimSpace(rangeHeader) == "" {
+		return 0, 0, false, nil
+	}
+	if !strings.HasPrefix(rangeHeader, "bytes=") {
+		return 0, 0, false, fmt.Errorf("unsupported range unit")
+	}
+	raw := strings.TrimPrefix(rangeHeader, "bytes=")
+	if strings.Contains(raw, ",") {
+		return 0, 0, false, fmt.Errorf("multiple ranges not supported")
+	}
+	pair := strings.SplitN(raw, "-", 2)
+	if len(pair) != 2 {
+		return 0, 0, false, fmt.Errorf("invalid range format")
+	}
+	if total <= 0 {
+		return 0, 0, false, fmt.Errorf("invalid total length")
+	}
+	startRaw := strings.TrimSpace(pair[0])
+	endRaw := strings.TrimSpace(pair[1])
+
+	var start, end int64
+	switch {
+	case startRaw == "":
+		// suffix range: bytes=-500
+		n, err := strconv.ParseInt(endRaw, 10, 64)
+		if err != nil || n <= 0 {
+			return 0, 0, false, fmt.Errorf("invalid suffix range")
+		}
+		if n > total {
+			n = total
+		}
+		start = total - n
+		end = total - 1
+	default:
+		v, err := strconv.ParseInt(startRaw, 10, 64)
+		if err != nil || v < 0 {
+			return 0, 0, false, fmt.Errorf("invalid range start")
+		}
+		start = v
+		if endRaw == "" {
+			end = total - 1
+		} else {
+			v, err := strconv.ParseInt(endRaw, 10, 64)
+			if err != nil || v < start {
+				return 0, 0, false, fmt.Errorf("invalid range end")
+			}
+			end = v
+		}
+	}
+	if start >= total {
+		return 0, 0, false, fmt.Errorf("range start out of bounds")
+	}
+	if end >= total {
+		end = total - 1
+	}
+	return start, end, true, nil
+}
+
+func (s *Server) copyDashBytes(ctx context.Context, w io.Writer, m dashByteMap, from, to int64) error {
+	for _, chunk := range m.Chunks {
+		if to < chunk.Start || from > chunk.End {
+			continue
+		}
+		localStart := int64(0)
+		if from > chunk.Start {
+			localStart = from - chunk.Start
+		}
+		localEnd := chunk.Length - 1
+		if to < chunk.End {
+			localEnd = to - chunk.Start
+		}
+		if err := s.copyChunkRange(ctx, w, chunk.URL, localStart, localEnd); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) copyChunkRange(ctx context.Context, w io.Writer, target string, start, end int64) error {
+	if start < 0 || end < start {
+		return fmt.Errorf("invalid chunk range")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return err
+	}
+	full := start == 0
+	if !full || end >= 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+	}
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("chunk status %d", resp.StatusCode)
+	}
+
+	want := end - start + 1
+	if resp.StatusCode == http.StatusOK && start > 0 {
+		if _, err := io.CopyN(io.Discard, resp.Body, start); err != nil {
+			return err
+		}
+	}
+	_, err = io.CopyN(w, resp.Body, want)
+	if err != nil && err != io.EOF {
+		return err
+	}
+	return nil
+}
