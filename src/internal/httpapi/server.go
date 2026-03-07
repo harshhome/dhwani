@@ -171,3 +171,124 @@ func (s *Server) requestLogMiddleware(next http.Handler) http.Handler {
 
 		client := strings.TrimSpace(r.URL.Query().Get("c"))
 		if client == "" {
+			client = "-"
+		}
+		id := strings.TrimSpace(r.URL.Query().Get("id"))
+		if len(id) > 24 {
+			id = id[:24] + "..."
+		}
+		logLevel := slog.LevelInfo
+		if lrw.status == http.StatusNotFound && strings.HasSuffix(r.URL.Path, "/scrobble.view") {
+			// Unsupported scrobble polling from some clients can be very noisy.
+			logLevel = slog.LevelDebug
+		}
+
+		attrs := []any{
+			"method", r.Method,
+			"path", r.URL.Path,
+			"client", client,
+			"id", id,
+			"status", lrw.status,
+			"bytes", lrw.bytes,
+			"duration_ms", duration.Milliseconds(),
+			"req_id", middleware.GetReqID(r.Context()),
+			"client_ip", r.RemoteAddr,
+			"user_agent", r.UserAgent(),
+		}
+		if s.logger.Enabled(r.Context(), slog.LevelDebug) {
+			attrs = append(attrs, "query", summarizeQueryForLog(r.URL.RawQuery))
+		}
+		s.logger.Log(r.Context(), logLevel, "request", attrs...)
+		if duration >= 2*time.Second {
+			s.logger.Warn("slow request",
+				"method", r.Method,
+				"path", r.URL.Path,
+				"status", lrw.status,
+				"duration_ms", duration.Milliseconds(),
+				"req_id", middleware.GetReqID(r.Context()),
+			)
+		}
+	})
+}
+
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (w *loggingResponseWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *loggingResponseWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.bytes += n
+	return n, err
+}
+
+func redactedQueryForLog(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return ""
+	}
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		return "[redacted]"
+	}
+	for key := range values {
+		if isSensitiveQueryKey(key) {
+			values.Set(key, "[redacted]")
+		}
+	}
+	return values.Encode()
+}
+
+func summarizeQueryForLog(raw string) string {
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		return "[redacted]"
+	}
+	keep := []string{"c", "v", "f", "id", "query", "size", "offset", "submission", "time"}
+	out := make([]string, 0, len(keep))
+	for _, k := range keep {
+		v := strings.TrimSpace(values.Get(k))
+		if v == "" {
+			continue
+		}
+		if k == "query" && len(v) > 40 {
+			v = v[:40] + "..."
+		}
+		if k == "id" && len(v) > 24 {
+			v = v[:24] + "..."
+		}
+		out = append(out, fmt.Sprintf("%s=%s", k, strconv.Quote(v)))
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	return strings.Join(out, " ")
+}
+
+func isSensitiveQueryKey(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "u", "p", "t", "s", "token", "password", "api_key", "apikey":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) withTimeout(r *http.Request, sec int) (context.Context, context.CancelFunc) {
+	if sec <= 0 {
+		sec = 20
+	}
+	return context.WithTimeout(r.Context(), time.Duration(sec)*time.Second)
+}
+
+func onePixelPNG() []byte {
+	return []byte{137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 252, 255, 31, 0, 3, 3, 2, 0, 239, 166, 133, 39, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130}
+}
