@@ -558,3 +558,283 @@ func (s *Server) searchCommon(w http.ResponseWriter, r *http.Request, useSearchR
 		if searchLimit > 100 {
 			searchLimit = 100
 		}
+		var err error
+		res, err = s.catalog.Search(ctx, query, searchLimit)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				s.logger.Info("search canceled", "query", query)
+				payload := &subsonic.PayloadUnion{}
+				searchRes := &subsonic.SearchResult{
+					Artists: []subsonic.Artist{},
+					Albums:  []subsonic.Album{},
+					Songs:   []subsonic.Song{},
+				}
+				if useSearchResult2 {
+					payload.SearchResult2 = searchRes
+				} else {
+					payload.SearchResult = searchRes
+				}
+				subsonic.Write(w, r, http.StatusOK, subsonic.NewSuccess(payload))
+				return
+			}
+			subsonic.Write(w, r, http.StatusBadGateway, subsonic.NewError(70, "search failed"))
+			return
+		}
+		res.Artists = sliceArtists(res.Artists, artistOffset, artistCount)
+		res.Albums = sliceAlbums(res.Albums, albumOffset, albumCount)
+		res.Tracks = sliceTracks(res.Tracks, songOffset, songCount)
+		s.catalog.RememberTracks(res.Tracks)
+	}
+	// Apply offsets for local list mode.
+	if query == "" {
+		res.Artists = sliceArtists(res.Artists, artistOffset, artistCount)
+		res.Albums = sliceAlbums(res.Albums, albumOffset, albumCount)
+		res.Tracks = sliceTracks(res.Tracks, songOffset, songCount)
+	}
+
+	artists := make([]subsonic.Artist, 0, len(res.Artists))
+	for _, a := range res.Artists {
+		artists = append(artists, subsonic.Artist{
+			ID:             s.artistCoverArtID(a.ID),
+			Name:           a.Name,
+			CoverArt:       s.artistCoverArtID(a.ID),
+			ArtistImageURL: a.CoverArtURL,
+		})
+	}
+	albums := make([]subsonic.Album, 0, len(res.Albums))
+	for _, a := range res.Albums {
+		albums = append(albums, subsonic.Album{
+			ID:            s.albumCoverArtID(a.ID),
+			Name:          a.Name,
+			Artist:        a.Artist,
+			DisplayArtist: a.Artist,
+			ArtistID:      s.artistCoverArtID(a.ArtistID),
+			Year:          a.Year,
+			CoverArt:      s.albumCoverArtID(a.ID),
+		})
+	}
+	songs := make([]subsonic.Song, 0, len(res.Tracks))
+	for _, t := range res.Tracks {
+		songs = append(songs, s.toSubsonicSong(t))
+	}
+
+	payload := &subsonic.PayloadUnion{}
+	searchRes := &subsonic.SearchResult{Artists: artists, Albums: albums, Songs: songs}
+	if useSearchResult2 {
+		payload.SearchResult2 = searchRes
+	} else {
+		payload.SearchResult = searchRes
+	}
+	subsonic.Write(w, r, http.StatusOK, subsonic.NewSuccess(payload))
+}
+
+func (s *Server) getSong(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		subsonic.Write(w, r, http.StatusBadRequest, subsonic.NewError(10, "id is required"))
+		return
+	}
+
+	ctx, cancel := s.withTimeout(r, 20)
+	defer cancel()
+
+	track, err := s.catalog.GetTrack(ctx, id)
+	if err != nil {
+		cached, cErr := s.catalog.GetCachedTrackAny(ctx, id)
+		if cErr != nil {
+			if service.IsNotFound(err) {
+				subsonic.Write(w, r, http.StatusNotFound, subsonic.NewError(70, "song not found"))
+				return
+			}
+			subsonic.Write(w, r, http.StatusBadRequest, subsonic.NewError(70, "could not resolve song"))
+			return
+		}
+		track = cached
+	}
+	if strings.TrimSpace(track.Title) == "" || strings.TrimSpace(track.Artist) == "" || strings.TrimSpace(track.Album) == "" {
+		if cached, cErr := s.catalog.GetCachedTrackAny(ctx, id); cErr == nil {
+			if strings.TrimSpace(track.Title) == "" {
+				track.Title = cached.Title
+			}
+			if strings.TrimSpace(track.Artist) == "" {
+				track.Artist = cached.Artist
+			}
+			if strings.TrimSpace(track.Album) == "" {
+				track.Album = cached.Album
+			}
+			if strings.TrimSpace(track.ArtistID) == "" {
+				track.ArtistID = cached.ArtistID
+			}
+			if strings.TrimSpace(track.AlbumID) == "" {
+				track.AlbumID = cached.AlbumID
+			}
+			if strings.TrimSpace(track.CoverArtURL) == "" {
+				track.CoverArtURL = cached.CoverArtURL
+			}
+		}
+	}
+	if strings.TrimSpace(track.Title) == "" {
+		track.Title = "Track " + strings.TrimSpace(id)
+	}
+	if strings.TrimSpace(track.Artist) == "" {
+		track.Artist = "Unknown Artist"
+	}
+	if strings.TrimSpace(track.Album) == "" {
+		track.Album = "Unknown Album"
+	}
+	if strings.TrimSpace(track.ArtistID) == "" {
+		track.ArtistID = "unknown-artist"
+	}
+	if strings.TrimSpace(track.AlbumID) == "" {
+		track.AlbumID = "unknown-album"
+	}
+	s.catalog.RememberTracks([]model.Track{track})
+
+	albumArtist, albumArtistID := s.resolveAlbumArtist(ctx, track.AlbumID, track.Artist, track.ArtistID)
+	payload := &subsonic.PayloadUnion{Song: ptrSong(s.toSubsonicSongWithAlbumArtist(track, albumArtist, albumArtistID))}
+	subsonic.Write(w, r, http.StatusOK, subsonic.NewSuccess(payload))
+}
+
+func (s *Server) getArtist(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		subsonic.Write(w, r, http.StatusBadRequest, subsonic.NewError(10, "id is required"))
+		return
+	}
+	id = rawArtistID(id)
+	ctx, cancel := s.withTimeout(r, 20)
+	defer cancel()
+	artist, err := s.catalog.GetArtist(ctx, id)
+	if err != nil {
+		cached, cErr := s.catalog.GetCachedArtist(ctx, id)
+		if cErr != nil {
+			if service.IsNotFound(err) {
+				subsonic.Write(w, r, http.StatusNotFound, subsonic.NewError(70, "artist not found"))
+				return
+			}
+			subsonic.Write(w, r, http.StatusBadRequest, subsonic.NewError(70, "could not resolve artist"))
+			return
+		}
+		artist = cached
+	}
+	albums, err := s.catalog.GetArtistAlbumsLive(ctx, id, 500, 0)
+	if err != nil {
+		// Fallback to local cache for partially known artists.
+		albums, _ = s.catalog.ListAlbumsByArtist(ctx, id, 500, 0)
+	}
+	subAlbums := make([]subsonic.Album, 0, len(albums))
+	for _, a := range albums {
+		subAlbums = append(subAlbums, subsonic.Album{
+			ID:            s.albumCoverArtID(a.ID),
+			Name:          a.Name,
+			Artist:        a.Artist,
+			DisplayArtist: a.Artist,
+			ArtistID:      s.artistCoverArtID(a.ArtistID),
+			CoverArt:      s.albumCoverArtID(a.ID),
+			Year:          a.Year,
+			SongCount:     a.SongCount,
+			Duration:      a.DurationSec,
+		})
+	}
+	payload := &subsonic.PayloadUnion{Artist: &subsonic.Artist{
+		ID:             s.artistCoverArtID(artist.ID),
+		Name:           artist.Name,
+		CoverArt:       s.artistCoverArtID(artist.ID),
+		ArtistImageURL: artist.CoverArtURL,
+		AlbumCount:     len(subAlbums),
+		Albums:         subAlbums,
+	}}
+	subsonic.Write(w, r, http.StatusOK, subsonic.NewSuccess(payload))
+}
+
+func (s *Server) getAlbum(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		subsonic.Write(w, r, http.StatusBadRequest, subsonic.NewError(10, "id is required"))
+		return
+	}
+	id = rawAlbumID(id)
+	ctx, cancel := s.withTimeout(r, 20)
+	defer cancel()
+	album, err := s.catalog.GetAlbum(ctx, id)
+	if err != nil {
+		cached, cErr := s.catalog.GetCachedAlbum(ctx, id)
+		if cErr != nil {
+			if service.IsNotFound(err) {
+				subsonic.Write(w, r, http.StatusNotFound, subsonic.NewError(70, "album not found"))
+				return
+			}
+			subsonic.Write(w, r, http.StatusBadRequest, subsonic.NewError(70, "could not resolve album"))
+			return
+		}
+		album = cached
+	}
+	tracks, err := s.catalog.GetAlbumTracksLive(ctx, id, 1000, 0)
+	if err != nil {
+		// Fallback to locally cached tracks if upstream fails.
+		tracks, _ = s.catalog.ListTracksByAlbum(ctx, id, 1000, 0)
+	}
+	if len(tracks) == 0 {
+		tracks, _ = s.catalog.ListTracksByAlbum(ctx, id, 1000, 0)
+	}
+	// Some provider album payloads omit artist linkage; backfill from tracks.
+	if strings.TrimSpace(album.Artist) == "" || strings.TrimSpace(album.ArtistID) == "" {
+		for _, t := range tracks {
+			if strings.TrimSpace(album.Artist) == "" && strings.TrimSpace(t.Artist) != "" {
+				album.Artist = t.Artist
+			}
+			if strings.TrimSpace(album.ArtistID) == "" && strings.TrimSpace(t.ArtistID) != "" {
+				album.ArtistID = t.ArtistID
+			}
+			if strings.TrimSpace(album.Artist) != "" && strings.TrimSpace(album.ArtistID) != "" {
+				break
+			}
+		}
+	}
+	// Keep recently viewed album tracks hot so star-ingestion can reuse rich metadata.
+	s.catalog.RememberTracks(tracks)
+	songs := make([]subsonic.Song, 0, len(tracks))
+	for _, t := range tracks {
+		songs = append(songs, s.toSubsonicSongWithAlbumArtist(t, album.Artist, album.ArtistID))
+	}
+	totalDuration := 0
+	for _, t := range tracks {
+		totalDuration += t.DurationSec
+	}
+	payload := &subsonic.PayloadUnion{Album: &subsonic.Album{
+		ID:            s.albumCoverArtID(album.ID),
+		Name:          album.Name,
+		Artist:        album.Artist,
+		DisplayArtist: album.Artist,
+		ArtistID:      s.artistCoverArtID(album.ArtistID),
+		Year:          album.Year,
+		CoverArt:      s.albumCoverArtID(album.ID),
+		SongCount:     len(songs),
+		Duration:      totalDuration,
+		Songs:         songs,
+	}}
+	subsonic.Write(w, r, http.StatusOK, subsonic.NewSuccess(payload))
+}
+
+func (s *Server) getCoverArt(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		writePlaceholder(w, s.placeHolder)
+		return
+	}
+	id = strings.TrimSpace(id)
+	ctx, cancel := s.withTimeout(r, 4)
+	defer cancel()
+
+	kind, rawID := parseCoverArtID(id)
+
+	if kind == "artist" {
+		// Keep prefixed artist IDs type-safe: only resolve artist artwork.
+		if artist, err := s.catalog.GetCachedArtistAny(ctx, rawID); err == nil && strings.TrimSpace(artist.CoverArtURL) != "" {
+			s.proxyBinary(w, r, artist.CoverArtURL)
+			return
+		}
+		artist, err := s.catalog.GetArtist(ctx, rawID)
+		if err == nil && artist.CoverArtURL != "" {
+			s.proxyBinary(w, r, artist.CoverArtURL)
+			return
