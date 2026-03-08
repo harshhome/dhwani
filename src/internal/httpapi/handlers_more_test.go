@@ -259,3 +259,185 @@ func TestGetSongUsesAlbumArtistFromCacheFirst(t *testing.T) {
 	}
 }
 
+func TestGetAlbumSongsUseAlbumArtist(t *testing.T) {
+	fp := &fakeProvider{
+		album: model.Album{
+			ID:         "84097168",
+			Provider:   "mx1",
+			ProviderID: "84097168",
+			Name:       "Aur Kaun? (Original Motion Picture Soundtrack)",
+			Artist:     "Bappi Lahiri",
+			ArtistID:   "3633746",
+			Year:       1979,
+		},
+		albumTracks: []model.Track{
+			{
+				ID:          "84097169",
+				Provider:    "mx1",
+				ProviderID:  "84097169",
+				Title:       "Haan Pahli Bar",
+				Artist:      "Kishore Kumar",
+				ArtistID:    "33057",
+				Album:       "Aur Kaun? (Original Motion Picture Soundtrack)",
+				AlbumID:     "84097168",
+				TrackNumber: 1,
+				ContentType: "audio/flac",
+			},
+			{
+				ID:          "84097170",
+				Provider:    "mx1",
+				ProviderID:  "84097170",
+				Title:       "Aur Kaun Aayega",
+				Artist:      "Lata Mangeshkar",
+				ArtistID:    "30815",
+				Album:       "Aur Kaun? (Original Motion Picture Soundtrack)",
+				AlbumID:     "84097168",
+				TrackNumber: 2,
+				ContentType: "audio/flac",
+			},
+		},
+	}
+	srv, store := newTestServer(t, fp, false)
+	defer store.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/rest/getAlbum.view?u=u&p=p&v=1.16.1&c=test&f=json&id=al-84097168", nil)
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("getAlbum status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var out map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatalf("json decode: %v", err)
+	}
+	resp, _ := out["subsonic-response"].(map[string]any)
+	album, _ := resp["album"].(map[string]any)
+	songs, _ := album["song"].([]any)
+	if len(songs) != 2 {
+		t.Fatalf("expected 2 songs, got %d", len(songs))
+	}
+	for i, raw := range songs {
+		song, _ := raw.(map[string]any)
+		if got := song["displayAlbumArtist"]; got != "Bappi Lahiri" {
+			t.Fatalf("song[%d] expected displayAlbumArtist=Bappi Lahiri, got %#v", i, got)
+		}
+		albumArtists, _ := song["albumArtists"].([]any)
+		if len(albumArtists) != 1 {
+			t.Fatalf("song[%d] expected 1 albumArtists entry, got %d", i, len(albumArtists))
+		}
+		aa, _ := albumArtists[0].(map[string]any)
+		if got := aa["name"]; got != "Bappi Lahiri" {
+			t.Fatalf("song[%d] expected albumArtists[0].name=Bappi Lahiri, got %#v", i, got)
+		}
+		if got := aa["id"]; got != "ar-3633746" {
+			t.Fatalf("song[%d] expected albumArtists[0].id=ar-3633746, got %#v", i, got)
+		}
+	}
+}
+
+func TestBuildFFmpegMetadataArgs(t *testing.T) {
+	tr := model.Track{
+		Title:         "Yeh Jo Mohabbat Hai",
+		Artist:        "Kishore Kumar",
+		DisplayArtist: "Kishore Kumar",
+		Album:         "Kati Patang",
+		TrackNumber:   12,
+		DiscNumber:    1,
+		Genre:         "International",
+	}
+	got := buildFFmpegMetadataArgs(tr, "R. D. Burman", 1970)
+	want := []string{
+		"-metadata", "title=Yeh Jo Mohabbat Hai",
+		"-metadata", "artist=Kishore Kumar",
+		"-metadata", "album=Kati Patang",
+		"-metadata", "album_artist=R. D. Burman",
+		"-metadata", "date=1970",
+		"-metadata", "track=12",
+		"-metadata", "disc=1",
+		"-metadata", "genre=International",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("unexpected arg length: got %d want %d (%v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("arg[%d] mismatch: got %q want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestDetectAudioExtFromFile(t *testing.T) {
+	cases := []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{name: "flac", data: []byte("fLaCxxxx"), want: "flac"},
+		{name: "m4a", data: []byte{0x00, 0x00, 0x00, 0x18, 'f', 't', 'y', 'p', 'M', '4', 'A', ' '}, want: "m4a"},
+		{name: "mp3 id3", data: []byte("ID3abcd"), want: "mp3"},
+		{name: "unknown", data: []byte("xxxx"), want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			p := filepath.Join(dir, "audio.bin")
+			if err := os.WriteFile(p, tc.data, 0o644); err != nil {
+				t.Fatalf("write file: %v", err)
+			}
+			got, err := detectAudioExtFromFile(p)
+			if err != nil {
+				t.Fatalf("detectAudioExtFromFile error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("detectAudioExtFromFile got %q want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestStarHandlerIngestEnabled(t *testing.T) {
+	fp := &fakeProvider{
+		track: model.Track{
+			ID:          "t-ingest",
+			Provider:    "triton",
+			ProviderID:  "t-ingest",
+			Title:       "Ingest Song",
+			Artist:      "Ingest Artist",
+			Album:       "Ingest Album",
+			ArtistID:    "ar-ingest",
+			AlbumID:     "al-ingest",
+			ContentType: "audio/flac",
+		},
+	}
+	srv, store := newTestServer(t, fp, true)
+	defer store.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/rest/star.view?u=u&p=p&v=1.16.1&c=test&f=json&id=t-ingest", nil)
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("star status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	// async ingest path
+	time.Sleep(120 * time.Millisecond)
+	if _, err := store.GetTrackMetadataByID(context.Background(), "t-ingest"); err != nil {
+		t.Fatalf("expected ingested track in store, err=%v", err)
+	}
+}
+
+func TestSplitLyricsLinesAndPickLyricsTrackHelpers(t *testing.T) {
+	lines := splitLyricsLines("  one \n\n two  \n")
+	if len(lines) != 2 || lines[0] != "one" || lines[1] != "two" {
+		t.Fatalf("unexpected splitLyricsLines output: %#v", lines)
+	}
+	tr := pickLyricsTrack([]model.Track{
+		{ID: "1", Title: "Hello", Artist: "A"},
+		{ID: "2", Title: "World", Artist: "B"},
+	}, "B", "World")
+	if tr.ID != "2" {
+		t.Fatalf("pickLyricsTrack expected ID=2 got %#v", tr)
+	}
+}
+
