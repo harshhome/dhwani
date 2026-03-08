@@ -338,7 +338,7 @@ func NewSuccess(payload *PayloadUnion) Response {
 		Status:        "ok",
 		Version:       APIVersion,
 		Type:          "dhwani",
-		ServerVersion: "0.0.2",
+		ServerVersion: "0.0.1",
 		OpenSubsonic:  true,
 		Xmlns:         "http://subsonic.org/restapi",
 	}
@@ -380,7 +380,7 @@ func NewError(code int, msg string) Response {
 		Status:        "failed",
 		Version:       APIVersion,
 		Type:          "dhwani",
-		ServerVersion: "0.0.2",
+		ServerVersion: "0.0.1",
 		OpenSubsonic:  true,
 		Xmlns:         "http://subsonic.org/restapi",
 		Error:         &Error{Code: code, Message: msg},
