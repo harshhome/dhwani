@@ -954,6 +954,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("stream finished", "id", id, "status", up.StatusCode)
 }
 
+
 func (s *Server) proxyBinary(w http.ResponseWriter, r *http.Request, target string) {
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
 	if err != nil {
@@ -1068,6 +1069,172 @@ func (s *Server) toDirectoryChild(t model.Track) subsonic.DirectoryChild {
 		AlbumID:     s.albumCoverArtID(t.AlbumID),
 	}
 }
+
+func (s *Server) star(w http.ResponseWriter, r *http.Request) {
+	_ = r.ParseForm()
+	trackIDs, albumIDs, artistIDs := parseStarTargets(r.Form["id"], r.Form["albumId"], r.Form["artistId"])
+	reqStart := time.Now()
+	s.logger.Info("star request accepted",
+		"track_ids", len(trackIDs),
+		"album_ids", len(albumIDs),
+		"artist_ids", len(artistIDs),
+		"ingest_enabled", s.ingestOnStar,
+	)
+
+	ctx, cancel := s.withTimeout(r, 10)
+	defer cancel()
+	for _, id := range trackIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if err := s.catalog.StarTrack(ctx, id); err != nil {
+			s.logger.Warn("star track persist failed", "id", id, "err", err)
+		}
+	}
+	for _, id := range albumIDs {
+		id = rawAlbumID(id)
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		if err := s.catalog.StarAlbum(ctx, id); err != nil {
+			s.logger.Warn("star album persist failed", "id", id, "err", err)
+		}
+	}
+	for _, id := range artistIDs {
+		id = rawArtistID(id)
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		if err := s.catalog.StarArtist(ctx, id); err != nil {
+			s.logger.Warn("star artist persist failed", "id", id, "err", err)
+		}
+	}
+
+	if s.ingestOnStar {
+		go func(trackIDs, albumIDs []string) {
+			bg, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer cancel()
+			ingestStart := time.Now()
+			trackOK, albumOK := 0, 0
+			for _, id := range trackIDs {
+				if strings.TrimSpace(id) == "" {
+					continue
+				}
+				if err := s.catalog.IngestStarredTrack(bg, id); err != nil {
+					s.logger.Warn("star track ingest failed", "id", id, "err", err)
+				} else {
+					trackOK++
+				}
+			}
+			for _, albumID := range albumIDs {
+				albumID = rawAlbumID(albumID)
+				if strings.TrimSpace(albumID) == "" {
+					continue
+				}
+				if err := s.catalog.IngestStarredAlbum(bg, albumID); err != nil {
+					s.logger.Warn("star album ingest failed", "id", albumID, "err", err)
+				} else {
+					albumOK++
+				}
+			}
+			s.logger.Info("star ingest completed",
+				"track_ok", trackOK,
+				"album_ok", albumOK,
+				"duration_ms", time.Since(ingestStart).Milliseconds(),
+			)
+		}(trackIDs, albumIDs)
+	}
+
+	// Keep star response minimal/fast for client compatibility.
+	subsonic.Write(w, r, http.StatusOK, subsonic.NewSuccess(nil))
+	s.logger.Debug("star response sent", "duration_ms", time.Since(reqStart).Milliseconds())
+}
+
+func (s *Server) unstar(w http.ResponseWriter, r *http.Request) {
+	_ = r.ParseForm()
+	trackIDs, albumIDs, artistIDs := parseStarTargets(r.Form["id"], r.Form["albumId"], r.Form["artistId"])
+	if len(trackIDs) == 0 && len(albumIDs) == 0 && len(artistIDs) == 0 {
+		subsonic.Write(w, r, http.StatusOK, subsonic.NewSuccess(nil))
+		return
+	}
+
+	ctx, cancel := s.withTimeout(r, 30)
+	defer cancel()
+	removed := 0
+	for _, id := range trackIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if err := s.catalog.UnstarTrack(ctx, id); err != nil {
+			s.logger.Warn("unstar track delete failed", "id", id, "err", err)
+		} else {
+			removed++
+		}
+	}
+	for _, id := range albumIDs {
+		id = rawAlbumID(id)
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		if err := s.catalog.UnstarAlbum(ctx, id); err != nil {
+			s.logger.Warn("unstar album delete failed", "id", id, "err", err)
+		}
+	}
+	for _, id := range artistIDs {
+		id = rawArtistID(id)
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		if err := s.catalog.UnstarArtist(ctx, id); err != nil {
+			s.logger.Warn("unstar artist delete failed", "id", id, "err", err)
+		}
+	}
+	s.logger.Info("unstar completed", "requested_tracks", len(trackIDs), "removed_tracks", removed, "requested_albums", len(albumIDs), "requested_artists", len(artistIDs))
+	subsonic.Write(w, r, http.StatusOK, subsonic.NewSuccess(nil))
+}
+
+func parseStarTargets(ids []string, albumIDs []string, artistIDs []string) (tracks []string, albums []string, artists []string) {
+	addTrack := func(v string) {
+		v = strings.TrimSpace(v)
+		if v != "" {
+			tracks = append(tracks, v)
+		}
+	}
+	addAlbum := func(v string) {
+		v = strings.TrimSpace(rawAlbumID(v))
+		if v != "" {
+			albums = append(albums, v)
+		}
+	}
+	addArtist := func(v string) {
+		v = strings.TrimSpace(rawArtistID(v))
+		if v != "" {
+			artists = append(artists, v)
+		}
+	}
+
+	for _, id := range ids {
+		kind, raw := parseCoverArtID(id)
+		switch kind {
+		case "album":
+			addAlbum(raw)
+		case "artist":
+			addArtist(raw)
+		default:
+			addTrack(id)
+		}
+	}
+	for _, id := range albumIDs {
+		addAlbum(id)
+	}
+	for _, id := range artistIDs {
+		addArtist(id)
+	}
+	return tracks, albums, artists
+}
+
 
 func (s *Server) tracksToSongs(in []model.Track) []subsonic.Song {
 	out := make([]subsonic.Song, 0, len(in))
