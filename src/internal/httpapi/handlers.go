@@ -838,3 +838,132 @@ func (s *Server) getCoverArt(w http.ResponseWriter, r *http.Request) {
 		if err == nil && artist.CoverArtURL != "" {
 			s.proxyBinary(w, r, artist.CoverArtURL)
 			return
+		}
+		writePlaceholder(w, s.placeHolder)
+		return
+	}
+
+	if kind == "album" {
+		// Keep prefixed album IDs type-safe: only resolve album artwork.
+		if album, err := s.catalog.GetCachedAlbumAny(ctx, rawID); err == nil && strings.TrimSpace(album.CoverArtURL) != "" {
+			s.proxyBinary(w, r, album.CoverArtURL)
+			return
+		}
+		album, err := s.catalog.GetAlbum(ctx, rawID)
+		if err == nil && album.CoverArtURL != "" {
+			s.proxyBinary(w, r, album.CoverArtURL)
+			return
+		}
+		writePlaceholder(w, s.placeHolder)
+		return
+	}
+
+	// Raw track IDs can use any cached source as fast path.
+	if u := s.catalog.ResolveCoverArtURL(ctx, rawID); u != "" {
+		s.proxyBinary(w, r, u)
+		return
+	}
+
+	// Track IDs are raw numeric IDs. Lookup track first, then album fallback.
+	track, err := s.catalog.GetTrack(ctx, rawID)
+	if err == nil && track.CoverArtURL != "" {
+		s.proxyBinary(w, r, track.CoverArtURL)
+		return
+	}
+
+	if strings.TrimSpace(track.AlbumID) != "" {
+		if album, aErr := s.catalog.GetAlbum(ctx, track.AlbumID); aErr == nil && album.CoverArtURL != "" {
+			s.proxyBinary(w, r, album.CoverArtURL)
+			return
+		}
+	}
+	if album, err := s.catalog.GetAlbum(ctx, rawID); err == nil && album.CoverArtURL != "" {
+		s.proxyBinary(w, r, album.CoverArtURL)
+		return
+	}
+
+	writePlaceholder(w, s.placeHolder)
+}
+
+func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		subsonic.Write(w, r, http.StatusBadRequest, subsonic.NewError(10, "id is required"))
+		return
+	}
+
+	ctx, cancel := s.withTimeout(r, 45)
+	defer cancel()
+	res, err := s.catalog.ResolveStream(ctx, id)
+	if err != nil {
+		s.logger.Warn("stream resolution failed", "id", id, "err", err)
+		if errors.Is(err, provider.ErrNoFullStream) {
+			subsonic.Write(w, r, http.StatusBadGateway, subsonic.NewError(70, "no FULL stream available"))
+			return
+		}
+		subsonic.Write(w, r, http.StatusBadGateway, subsonic.NewError(70, "could not resolve stream"))
+		return
+	}
+	if s.ingestOnStream {
+		go func(trackID string) {
+			bg, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			s.catalog.RecordPlayedTrack(bg, trackID)
+		}(id)
+	}
+
+	if strings.EqualFold(res.ManifestMIME, "application/dash+xml") {
+		s.logger.Info("stream start", "id", id, "provider", res.Provider, "type", "dash", "range", r.Header.Get("Range"))
+		if err := s.streamDASH(w, r, id, res); err != nil {
+			if errors.Is(err, errInvalidRange) {
+				subsonic.Write(w, r, http.StatusRequestedRangeNotSatisfiable, subsonic.NewError(10, "invalid range"))
+				return
+			}
+			s.logger.Warn("dash stream failed", "id", id, "provider", res.Provider, "err", err)
+			subsonic.Write(w, r, http.StatusBadGateway, subsonic.NewError(70, "could not serve DASH stream"))
+			return
+		}
+		s.logger.Info("stream finished", "id", id, "provider", res.Provider, "type", "dash")
+		return
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, res.MediaURL, nil)
+	if err != nil {
+		subsonic.Write(w, r, http.StatusBadGateway, subsonic.NewError(70, "invalid upstream stream url"))
+		return
+	}
+	if rg := r.Header.Get("Range"); rg != "" {
+		req.Header.Set("Range", rg)
+	}
+
+	s.logger.Info("stream start", "id", id, "provider", res.Provider, "range", r.Header.Get("Range"))
+	up, err := s.httpClient.Do(req)
+	if err != nil {
+		subsonic.Write(w, r, http.StatusBadGateway, subsonic.NewError(70, "upstream stream failed"))
+		return
+	}
+	defer up.Body.Close()
+
+	if up.StatusCode >= 400 {
+		s.logger.Warn("upstream stream status", "status", up.StatusCode, "id", id)
+		subsonic.Write(w, r, http.StatusBadGateway, subsonic.NewError(70, fmt.Sprintf("upstream returned %d", up.StatusCode)))
+		return
+	}
+
+	passthroughHeaders(up.Header, w.Header())
+	if w.Header().Get("Content-Type") == "" {
+		w.Header().Set("Content-Type", res.ManifestMIME)
+	}
+	w.WriteHeader(up.StatusCode)
+
+	_, copyErr := io.Copy(w, up.Body)
+	if copyErr != nil && !errors.Is(copyErr, io.EOF) && r.Context().Err() == nil {
+		s.logger.Warn("stream copy error", "id", id, "err", copyErr)
+		return
+	}
+	s.logger.Info("stream finished", "id", id, "status", up.StatusCode)
+}
+
+func (s *Server) proxyBinary(w http.ResponseWriter, r *http.Request, target string) {
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
+	if err != nil {
