@@ -875,6 +875,157 @@ func (s *Server) getCoverArt(w http.ResponseWriter, r *http.Request) {
 	writePlaceholder(w, s.placeHolder)
 }
 
+func (s *Server) getLyrics(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	artistQ := strings.TrimSpace(r.URL.Query().Get("artist"))
+	titleQ := strings.TrimSpace(r.URL.Query().Get("title"))
+
+	if id == "" && titleQ == "" && artistQ == "" {
+		subsonic.Write(w, r, http.StatusBadRequest, subsonic.NewError(10, "id or artist/title is required"))
+		return
+	}
+
+	ctx, cancel := s.withTimeout(r, 20)
+	defer cancel()
+
+	var selected model.Track
+	if id == "" {
+		query := strings.TrimSpace(strings.TrimSpace(artistQ + " " + titleQ))
+		res, err := s.catalog.Search(ctx, query, 25)
+		if err != nil || len(res.Tracks) == 0 {
+			subsonic.Write(w, r, http.StatusNotFound, subsonic.NewError(70, "lyrics not found"))
+			return
+		}
+		selected = pickLyricsTrack(res.Tracks, artistQ, titleQ)
+		id = selected.ID
+	}
+
+	lyrics, err := s.catalog.GetLyrics(ctx, id)
+	if err != nil {
+		subsonic.Write(w, r, http.StatusNotFound, subsonic.NewError(70, "lyrics not found"))
+		return
+	}
+	if strings.TrimSpace(lyrics.Artist) == "" {
+		if strings.TrimSpace(selected.Artist) != "" {
+			lyrics.Artist = selected.Artist
+		} else {
+			lyrics.Artist = artistQ
+		}
+	}
+	if strings.TrimSpace(lyrics.Title) == "" {
+		if strings.TrimSpace(selected.Title) != "" {
+			lyrics.Title = selected.Title
+		} else {
+			lyrics.Title = titleQ
+		}
+	}
+	if strings.TrimSpace(lyrics.Text) == "" && len(lyrics.Lines) > 0 {
+		plain := make([]string, 0, len(lyrics.Lines))
+		for _, ln := range lyrics.Lines {
+			plain = append(plain, ln.Value)
+		}
+		lyrics.Text = strings.Join(plain, "\n")
+	}
+
+	payload := &subsonic.PayloadUnion{
+		Lyrics: &subsonic.Lyrics{
+			Artist: lyrics.Artist,
+			Title:  lyrics.Title,
+			Value:  lyrics.Text,
+		},
+	}
+	subsonic.Write(w, r, http.StatusOK, subsonic.NewSuccess(payload))
+}
+
+func (s *Server) getLyricsBySongID(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		subsonic.Write(w, r, http.StatusBadRequest, subsonic.NewError(10, "id is required"))
+		return
+	}
+
+	ctx, cancel := s.withTimeout(r, 20)
+	defer cancel()
+	lyrics, err := s.catalog.GetLyrics(ctx, id)
+	if err != nil {
+		subsonic.Write(w, r, http.StatusNotFound, subsonic.NewError(70, "lyrics not found"))
+		return
+	}
+
+	lines := make([]subsonic.LyricsLine, 0)
+	synced := false
+	if len(lyrics.Lines) > 0 {
+		synced = true
+		for _, ln := range lyrics.Lines {
+			lines = append(lines, subsonic.LyricsLine{
+				Start: ln.StartMs,
+				Value: ln.Value,
+			})
+		}
+	} else {
+		for _, ln := range splitLyricsLines(lyrics.Text) {
+			lines = append(lines, subsonic.LyricsLine{Value: ln})
+		}
+	}
+
+	payload := &subsonic.PayloadUnion{
+		LyricsList: &subsonic.LyricsList{
+			StructuredLyrics: []subsonic.StructuredLyrics{
+				{
+					DisplayArtist: lyrics.Artist,
+					DisplayTitle:  lyrics.Title,
+					Lang:          "und",
+					Offset:        0,
+					Synced:        synced,
+					Line:          lines,
+				},
+			},
+		},
+	}
+	subsonic.Write(w, r, http.StatusOK, subsonic.NewSuccess(payload))
+}
+
+func pickLyricsTrack(tracks []model.Track, artist, title string) model.Track {
+	if len(tracks) == 0 {
+		return model.Track{}
+	}
+	title = strings.ToLower(strings.TrimSpace(title))
+	artist = strings.ToLower(strings.TrimSpace(artist))
+	if title == "" && artist == "" {
+		return tracks[0]
+	}
+	for _, t := range tracks {
+		tTitle := strings.ToLower(strings.TrimSpace(t.Title))
+		tArtist := strings.ToLower(strings.TrimSpace(t.Artist))
+		if title != "" && artist != "" && tTitle == title && tArtist == artist {
+			return t
+		}
+	}
+	for _, t := range tracks {
+		tTitle := strings.ToLower(strings.TrimSpace(t.Title))
+		tArtist := strings.ToLower(strings.TrimSpace(t.Artist))
+		if title != "" && tTitle == title {
+			return t
+		}
+		if artist != "" && tArtist == artist {
+			return t
+		}
+	}
+	return tracks[0]
+}
+
+func splitLyricsLines(text string) []string {
+	raw := strings.Split(text, "\n")
+	out := make([]string, 0, len(raw))
+	for _, ln := range raw {
+		ln = strings.TrimSpace(ln)
+		if ln != "" {
+			out = append(out, ln)
+		}
+	}
+	return out
+}
+
 func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	if id == "" {
