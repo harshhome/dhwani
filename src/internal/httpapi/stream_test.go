@@ -238,3 +238,237 @@ func TestStreamDashRangePassthrough(t *testing.T) {
 	rr := httptest.NewRecorder()
 
 	srv.Router().ServeHTTP(rr, req)
+	if rr.Code != http.StatusPartialContent {
+		t.Fatalf("unexpected status: %d", rr.Code)
+	}
+	if got := rr.Header().Get("Content-Range"); got != "bytes 4-8/14" {
+		t.Fatalf("unexpected content-range: %q", got)
+	}
+	if body := rr.Body.String(); body != "ABCDE" {
+		t.Fatalf("unexpected body: %q", body)
+	}
+}
+
+func TestStreamNoFullReturnsSubsonicError(t *testing.T) {
+	reg := provider.NewRegistry()
+	if err := reg.Register(&fakeProvider{streamErr: provider.ErrNoFullStream}); err != nil {
+		t.Fatalf("register provider: %v", err)
+	}
+	catalog := service.NewCatalogService(reg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := NewServer(
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		catalog,
+		auth.Credentials{Username: "u", Password: "p"},
+		&http.Client{Timeout: 5 * time.Second},
+		true,
+		false,
+		true,
+	)
+	req := httptest.NewRequest(http.MethodGet, "/rest/stream.view?u=u&p=p&v=1.16.1&c=test&f=json&id=84097169", nil)
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("unexpected status: %d", rr.Code)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatalf("json decode: %v", err)
+	}
+	resp := out["subsonic-response"].(map[string]any)
+	errObj := resp["error"].(map[string]any)
+	if code := int(errObj["code"].(float64)); code != 70 {
+		t.Fatalf("unexpected error code: %d", code)
+	}
+	if msg := errObj["message"].(string); !strings.Contains(msg, "FULL") {
+		t.Fatalf("unexpected error message: %s", msg)
+	}
+}
+
+func TestStreamDashInvalidRangeReturns416(t *testing.T) {
+	segments := map[string][]byte{
+		"/init.mp4": []byte("INIT"),
+		"/1.mp4":    []byte("ABCDE"),
+		"/2.mp4":    []byte("FGHIJ"),
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, ok := segments[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+	}))
+	defer upstream.Close()
+
+	mpd := `<?xml version="1.0" encoding="UTF-8"?><MPD><Period><AdaptationSet mimeType="audio/mp4"><Representation id="r1"><SegmentTemplate initialization="` + upstream.URL + `/init.mp4" media="` + upstream.URL + `/$Number$.mp4" startNumber="1"><SegmentTimeline><S d="1" r="1"/></SegmentTimeline></SegmentTemplate></Representation></AdaptationSet></Period></MPD>`
+	manifest := base64.StdEncoding.EncodeToString([]byte(mpd))
+
+	reg := provider.NewRegistry()
+	if err := reg.Register(&fakeProvider{
+		streamRes: model.StreamResolution{
+			Provider:        "triton",
+			TrackProviderID: "84097169",
+			ManifestMIME:    "application/dash+xml",
+			ManifestBase64:  manifest,
+			ManifestHash:    "h1",
+		},
+	}); err != nil {
+		t.Fatalf("register provider: %v", err)
+	}
+	catalog := service.NewCatalogService(reg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := NewServer(
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		catalog,
+		auth.Credentials{Username: "u", Password: "p"},
+		&http.Client{Timeout: 5 * time.Second},
+		true,
+		false,
+		true,
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "/rest/stream.view?u=u&p=p&v=1.16.1&c=test&f=json&id=84097169", nil)
+	req.Header.Set("Range", "bytes=99-120")
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("unexpected status: %d", rr.Code)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatalf("json decode: %v", err)
+	}
+	resp := out["subsonic-response"].(map[string]any)
+	errObj := resp["error"].(map[string]any)
+	if code := int(errObj["code"].(float64)); code != 10 {
+		t.Fatalf("unexpected error code: %d", code)
+	}
+}
+
+func TestGetCoverArtArtistPrefixOnlyUsesArtistLookup(t *testing.T) {
+	img := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ARTIST-IMG"))
+	}))
+	defer img.Close()
+
+	fp := &fakeProvider{
+		artist: model.Artist{ID: "123", CoverArtURL: img.URL},
+		track:  model.Track{ID: "123", CoverArtURL: img.URL + "/track"},
+		album:  model.Album{ID: "123", CoverArtURL: img.URL + "/album"},
+	}
+	reg := provider.NewRegistry()
+	if err := reg.Register(fp); err != nil {
+		t.Fatalf("register provider: %v", err)
+	}
+	catalog := service.NewCatalogService(reg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := NewServer(
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		catalog,
+		auth.Credentials{Username: "u", Password: "p"},
+		&http.Client{Timeout: 5 * time.Second},
+		true,
+		false,
+		true,
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "/rest/getCoverArt.view?u=u&p=p&v=1.16.1&c=test&id=ar-123", nil)
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rr.Code)
+	}
+	if body := rr.Body.String(); body != "ARTIST-IMG" {
+		t.Fatalf("unexpected body: %q", body)
+	}
+	if got := fp.getArtistCalls.Load(); got == 0 {
+		t.Fatalf("expected artist lookup")
+	}
+	if got := fp.getAlbumCalls.Load(); got != 0 {
+		t.Fatalf("expected no album lookups, got %d", got)
+	}
+	if got := fp.getTrackCalls.Load(); got != 0 {
+		t.Fatalf("expected no track lookups, got %d", got)
+	}
+}
+
+func TestGetCoverArtAlbumPrefixOnlyUsesAlbumLookup(t *testing.T) {
+	img := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ALBUM-IMG"))
+	}))
+	defer img.Close()
+
+	fp := &fakeProvider{
+		album:  model.Album{ID: "456", CoverArtURL: img.URL},
+		track:  model.Track{ID: "456", CoverArtURL: img.URL + "/track"},
+		artist: model.Artist{ID: "456", CoverArtURL: img.URL + "/artist"},
+	}
+	reg := provider.NewRegistry()
+	if err := reg.Register(fp); err != nil {
+		t.Fatalf("register provider: %v", err)
+	}
+	catalog := service.NewCatalogService(reg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := NewServer(
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		catalog,
+		auth.Credentials{Username: "u", Password: "p"},
+		&http.Client{Timeout: 5 * time.Second},
+		true,
+		false,
+		true,
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "/rest/getCoverArt.view?u=u&p=p&v=1.16.1&c=test&id=al-456", nil)
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rr.Code)
+	}
+	if body := rr.Body.String(); body != "ALBUM-IMG" {
+		t.Fatalf("unexpected body: %q", body)
+	}
+	if got := fp.getAlbumCalls.Load(); got == 0 {
+		t.Fatalf("expected album lookup")
+	}
+	if got := fp.getArtistCalls.Load(); got != 0 {
+		t.Fatalf("expected no artist lookups, got %d", got)
+	}
+	if got := fp.getTrackCalls.Load(); got != 0 {
+		t.Fatalf("expected no track lookups, got %d", got)
+	}
+}
+
+func TestCoverArtIDHelpers(t *testing.T) {
+	srv := &Server{}
+	if got := srv.artistCoverArtID("123"); got != "ar-123" {
+		t.Fatalf("unexpected artist cover id: %q", got)
+	}
+	if got := srv.albumCoverArtID("456"); got != "al-456" {
+		t.Fatalf("unexpected album cover id: %q", got)
+	}
+	if got := srv.trackCoverArtID("789"); got != "789" {
+		t.Fatalf("unexpected track cover id: %q", got)
+	}
+
+	kind, raw := parseCoverArtID("ar-123")
+	if kind != "artist" || raw != "123" {
+		t.Fatalf("unexpected parse for artist: kind=%q raw=%q", kind, raw)
+	}
+	kind, raw = parseCoverArtID("al-456")
+	if kind != "album" || raw != "456" {
+		t.Fatalf("unexpected parse for album: kind=%q raw=%q", kind, raw)
+	}
+	kind, raw = parseCoverArtID("789")
+	if kind != "track" || raw != "789" {
+		t.Fatalf("unexpected parse for track: kind=%q raw=%q", kind, raw)
+	}
+}
