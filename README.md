@@ -11,6 +11,8 @@ Dhwani is a self-hosted Subsonic/OpenSubsonic-compatible music proxy server writ
 - Exposes Subsonic/OpenSubsonic-compatible REST endpoints
 - Supports Subsonic auth styles (`u+p` and `u+t+s`)
 - Proxies catalog lookup and audio streaming for compatible clients
+- Stores starred metadata in SQLite
+- Fetches lyrics from upstream providers
 
 ## Requirements
 
@@ -68,3 +70,8 @@ curl "$BASE/rest/ping.view?u=$U&p=$P&v=1.16.1&c=curl"
 curl "$BASE/rest/search3.view?u=$U&p=$P&v=1.16.1&c=curl&query=artist&songCount=5"
 curl -L "$BASE/rest/stream.view?u=$U&p=$P&v=1.16.1&c=curl&id=<track-id>" -o sample.audio
 ```
+
+## Starring and Lyrics
+
+- `star`/`unstar` endpoints persist star state to local SQLite
+- `getLyrics` and `getLyricsBySongId` resolve lyrics from upstream providers
