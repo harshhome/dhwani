@@ -1,22 +1,12 @@
 package httpapi
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"image"
-	"image/draw"
-	"image/jpeg"
 	_ "image/png"
 	"io"
-	"math"
-	"net"
 	"net/http"
-	"net/url"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -690,7 +680,7 @@ func (s *Server) getSong(w http.ResponseWriter, r *http.Request) {
 	}
 	s.catalog.RememberTracks([]model.Track{track})
 
-	albumArtist, albumArtistID := s.resolveAlbumArtist(ctx, track.AlbumID, track.Artist, track.ArtistID)
+	albumArtist, albumArtistID := track.Artist, track.ArtistID
 	payload := &subsonic.PayloadUnion{Song: ptrSong(s.toSubsonicSongWithAlbumArtist(track, albumArtist, albumArtistID))}
 	subsonic.Write(w, r, http.StatusOK, subsonic.NewSuccess(payload))
 }
@@ -967,3 +957,256 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 func (s *Server) proxyBinary(w http.ResponseWriter, r *http.Request, target string) {
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
 	if err != nil {
+		writePlaceholder(w, s.placeHolder)
+		return
+	}
+	resp, err := s.httpClient.Do(req)
+	if err != nil || resp.StatusCode >= 400 {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		writePlaceholder(w, s.placeHolder)
+		return
+	}
+	defer resp.Body.Close()
+	passthroughHeaders(resp.Header, w.Header())
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+func passthroughHeaders(src, dst http.Header) {
+	for _, k := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified", "Cache-Control"} {
+		if v := src.Get(k); v != "" {
+			dst.Set(k, v)
+		}
+	}
+}
+
+func writePlaceholder(w http.ResponseWriter, b []byte) {
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Content-Length", strconv.Itoa(len(b)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(b)
+}
+
+func ptrSong(v subsonic.Song) *subsonic.Song { return &v }
+
+func (s *Server) toSubsonicSong(t model.Track) subsonic.Song {
+	return s.toSubsonicSongWithAlbumArtist(t, t.Artist, t.ArtistID)
+}
+
+func (s *Server) toSubsonicSongWithAlbumArtist(t model.Track, albumArtist string, albumArtistID string) subsonic.Song {
+	displayArtist := strings.TrimSpace(t.DisplayArtist)
+	if displayArtist == "" {
+		displayArtist = t.Artist
+	}
+	songArtists := make([]subsonic.SongArtist, 0, len(t.Artists))
+	for _, a := range t.Artists {
+		name := strings.TrimSpace(a.Name)
+		id := strings.TrimSpace(a.ID)
+		if name == "" && id == "" {
+			continue
+		}
+		songArtists = append(songArtists, subsonic.SongArtist{
+			ID:   s.artistCoverArtID(id),
+			Name: name,
+		})
+	}
+	if strings.TrimSpace(albumArtist) == "" {
+		albumArtist = t.Artist
+	}
+	if strings.TrimSpace(albumArtistID) == "" {
+		albumArtistID = t.ArtistID
+	}
+	albumArtists := []subsonic.SongArtist{}
+	if strings.TrimSpace(albumArtist) != "" || strings.TrimSpace(albumArtistID) != "" {
+		albumArtists = append(albumArtists, subsonic.SongArtist{
+			ID:   s.artistCoverArtID(albumArtistID),
+			Name: albumArtist,
+		})
+	}
+	return subsonic.Song{
+		ID:                 s.displayID(t.ID),
+		Parent:             s.albumCoverArtID(t.AlbumID),
+		Title:              t.Title,
+		Album:              t.Album,
+		Artist:             displayArtist,
+		DisplayArtist:      displayArtist,
+		Artists:            songArtists,
+		AlbumArtists:       albumArtists,
+		DisplayAlbumArtist: albumArtist,
+		Track:              t.TrackNumber,
+		Duration:           t.DurationSec,
+		BitRate:            t.BitRate,
+		ContentType:        t.ContentType,
+		CoverArt:           s.trackCoverArtID(t.ID),
+		ArtistID:           s.artistCoverArtID(t.ArtistID),
+		AlbumID:            s.albumCoverArtID(t.AlbumID),
+		DiscNumber:         t.DiscNumber,
+		Type:               "music",
+	}
+}
+
+func (s *Server) toDirectoryChild(t model.Track) subsonic.DirectoryChild {
+	displayArtist := strings.TrimSpace(t.DisplayArtist)
+	if displayArtist == "" {
+		displayArtist = t.Artist
+	}
+	return subsonic.DirectoryChild{
+		ID:          s.displayID(t.ID),
+		Parent:      s.albumCoverArtID(t.AlbumID),
+		IsDir:       false,
+		Title:       t.Title,
+		Album:       t.Album,
+		Artist:      displayArtist,
+		Track:       t.TrackNumber,
+		CoverArt:    s.trackCoverArtID(t.ID),
+		Duration:    t.DurationSec,
+		BitRate:     t.BitRate,
+		ContentType: t.ContentType,
+		ArtistID:    s.artistCoverArtID(t.ArtistID),
+		AlbumID:     s.albumCoverArtID(t.AlbumID),
+	}
+}
+
+func (s *Server) tracksToSongs(in []model.Track) []subsonic.Song {
+	out := make([]subsonic.Song, 0, len(in))
+	for _, t := range in {
+		out = append(out, s.toSubsonicSong(t))
+	}
+	return out
+}
+func (s *Server) displayID(v string) string {
+	return strings.TrimSpace(v)
+}
+
+func (s *Server) trackCoverArtID(id string) string {
+	return s.displayID(id)
+}
+
+func (s *Server) artistCoverArtID(id string) string {
+	id = s.displayID(id)
+	if id == "" {
+		return ""
+	}
+	return "ar-" + id
+}
+
+func (s *Server) albumCoverArtID(id string) string {
+	id = s.displayID(id)
+	if id == "" {
+		return ""
+	}
+	return "al-" + id
+}
+
+func parseCoverArtID(id string) (kind string, rawID string) {
+	trimmed := strings.TrimSpace(id)
+	switch {
+	case strings.HasPrefix(trimmed, "ar-"):
+		return "artist", strings.TrimPrefix(trimmed, "ar-")
+	case strings.HasPrefix(trimmed, "al-"):
+		return "album", strings.TrimPrefix(trimmed, "al-")
+	default:
+		return "track", trimmed
+	}
+}
+
+func rawArtistID(id string) string {
+	kind, rawID := parseCoverArtID(id)
+	if kind == "artist" {
+		return rawID
+	}
+	return strings.TrimSpace(id)
+}
+
+func rawAlbumID(id string) string {
+	kind, rawID := parseCoverArtID(id)
+	if kind == "album" {
+		return rawID
+	}
+	return strings.TrimSpace(id)
+}
+
+func paging(r *http.Request, def int) (limit int, offset int) {
+	limit, _ = strconv.Atoi(r.URL.Query().Get("size"))
+	if limit <= 0 {
+		limit = def
+	}
+	offset, _ = strconv.Atoi(r.URL.Query().Get("offset"))
+	if offset < 0 {
+		offset = 0
+	}
+	return
+}
+
+func limitFromSize(r *http.Request, def int) int {
+	size, _ := strconv.Atoi(r.URL.Query().Get("size"))
+	if size <= 0 {
+		return def
+	}
+	return size
+}
+
+func subsonicCountOffset(r *http.Request, countKey, offsetKey string, defCount int) (count int, offset int) {
+	rawCount := strings.TrimSpace(r.URL.Query().Get(countKey))
+	if rawCount == "" {
+		count = defCount
+	} else {
+		count, _ = strconv.Atoi(rawCount)
+		if count < 0 {
+			count = 0
+		}
+	}
+	if count > 200 {
+		count = 200
+	}
+	offset, _ = strconv.Atoi(r.URL.Query().Get(offsetKey))
+	if offset < 0 {
+		offset = 0
+	}
+	return count, offset
+}
+
+func maxInt(v ...int) int {
+	m := 0
+	for _, n := range v {
+		if n > m {
+			m = n
+		}
+	}
+	return m
+}
+
+func sliceArtists(in []model.Artist, offset, count int) []model.Artist {
+	if offset >= len(in) {
+		return []model.Artist{}
+	}
+	end := offset + count
+	if end > len(in) {
+		end = len(in)
+	}
+	return in[offset:end]
+}
+
+func sliceAlbums(in []model.Album, offset, count int) []model.Album {
+	if offset >= len(in) {
+		return []model.Album{}
+	}
+	end := offset + count
+	if end > len(in) {
+		end = len(in)
+	}
+	return in[offset:end]
+}
+
+func sliceTracks(in []model.Track, offset, count int) []model.Track {
+	if offset >= len(in) {
+		return []model.Track{}
+	}
+	end := offset + count
+	if end > len(in) {
+		end = len(in)
+	}
+	return in[offset:end]
+}
