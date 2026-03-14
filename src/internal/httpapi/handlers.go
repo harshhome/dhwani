@@ -1262,20 +1262,30 @@ func (s *Server) star(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if s.ingestOnStar {
+	if s.ingestOnStar || s.shouldDownloadOnStar() {
 		go func(trackIDs, albumIDs []string) {
 			bg, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 			defer cancel()
 			ingestStart := time.Now()
 			trackOK, albumOK := 0, 0
+			trackDownloadOK, albumDownloadOK := 0, 0
 			for _, id := range trackIDs {
 				if strings.TrimSpace(id) == "" {
 					continue
 				}
-				if err := s.catalog.IngestStarredTrack(bg, id); err != nil {
-					s.logger.Warn("star track ingest failed", "id", id, "err", err)
-				} else {
-					trackOK++
+				if s.ingestOnStar {
+					if err := s.catalog.IngestStarredTrack(bg, id); err != nil {
+						s.logger.Warn("star track ingest failed", "id", id, "err", err)
+					} else {
+						trackOK++
+					}
+				}
+				if s.shouldDownloadOnStar() {
+					if err := s.downloadStarredTrackWithRetry(bg, id); err != nil {
+						s.logger.Warn("star track download failed", "id", id, "err", err)
+					} else {
+						trackDownloadOK++
+					}
 				}
 			}
 			for _, albumID := range albumIDs {
@@ -1283,15 +1293,26 @@ func (s *Server) star(w http.ResponseWriter, r *http.Request) {
 				if strings.TrimSpace(albumID) == "" {
 					continue
 				}
-				if err := s.catalog.IngestStarredAlbum(bg, albumID); err != nil {
-					s.logger.Warn("star album ingest failed", "id", albumID, "err", err)
-				} else {
-					albumOK++
+				if s.ingestOnStar {
+					if err := s.catalog.IngestStarredAlbum(bg, albumID); err != nil {
+						s.logger.Warn("star album ingest failed", "id", albumID, "err", err)
+					} else {
+						albumOK++
+					}
+				}
+				if s.shouldDownloadOnStar() {
+					if err := s.downloadStarredAlbum(bg, albumID); err != nil {
+						s.logger.Warn("star album download failed", "id", albumID, "err", err)
+					} else {
+						albumDownloadOK++
+					}
 				}
 			}
 			s.logger.Info("star ingest completed",
 				"track_ok", trackOK,
 				"album_ok", albumOK,
+				"track_download_ok", trackDownloadOK,
+				"album_download_ok", albumDownloadOK,
 				"duration_ms", time.Since(ingestStart).Milliseconds(),
 			)
 		}(trackIDs, albumIDs)
@@ -1386,6 +1407,138 @@ func parseStarTargets(ids []string, albumIDs []string, artistIDs []string) (trac
 	return tracks, albums, artists
 }
 
+func (s *Server) shouldDownloadOnStar() bool {
+	return s.downloadOnStar && strings.TrimSpace(s.downloadDir) != ""
+}
+
+func (s *Server) downloadStarredAlbum(ctx context.Context, albumID string) error {
+	tracks, err := s.catalog.GetAlbumTracksLive(ctx, albumID, 2000, 0)
+	if err != nil || len(tracks) == 0 {
+		tracks, _ = s.catalog.ListTracksByAlbum(ctx, albumID, 2000, 0)
+	}
+	if len(tracks) == 0 {
+		return fmt.Errorf("no tracks found for album %s", albumID)
+	}
+	var firstErr error
+	for _, t := range tracks {
+		trackID := strings.TrimSpace(t.ID)
+		if trackID == "" {
+			trackID = strings.TrimSpace(t.ProviderID)
+		}
+		if trackID == "" {
+			continue
+		}
+		if err := s.downloadStarredTrackWithRetry(ctx, trackID); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+type downloadHTTPStatusError struct {
+	status int
+}
+
+func (e downloadHTTPStatusError) Error() string {
+	return fmt.Sprintf("upstream status %d", e.status)
+}
+
+func (s *Server) downloadStarredTrackWithRetry(ctx context.Context, trackID string) error {
+	attempts := s.downloadRetryAttempts
+	if attempts <= 0 {
+		attempts = 1
+	}
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		err := s.downloadStarredTrack(ctx, trackID)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt >= attempts || !isRetryableDownloadError(err) {
+			break
+		}
+		wait := time.Duration(200*attempt) * time.Millisecond
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+	return lastErr
+}
+
+func (s *Server) downloadStarredTrack(ctx context.Context, trackID string) error {
+	return fmt.Errorf("download track transfer not implemented")
+}
+
+func isRetryableDownloadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, provider.ErrNoFullStream) || service.IsNotFound(err) {
+		return false
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "none of requested download qualities satisfied") {
+		return false
+	}
+	var statusErr downloadHTTPStatusError
+	if errors.As(err, &statusErr) {
+		if statusErr.status == http.StatusRequestTimeout || statusErr.status == http.StatusTooManyRequests {
+			return true
+		}
+		return statusErr.status >= 500 && statusErr.status <= 599
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	return false
+}
+
+func firstNonEmptyTrimmed(values ...string) string {
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func (s *Server) resolveAlbumArtist(ctx context.Context, albumID string, fallbackArtist string, fallbackArtistID string) (string, string) {
+	artist := firstNonEmptyTrimmed(fallbackArtist)
+	artistID := firstNonEmptyTrimmed(fallbackArtistID)
+	albumID = strings.TrimSpace(albumID)
+	if albumID == "" {
+		return artist, artistID
+	}
+
+	// Prefer persisted album metadata and only fallback to provider when absent.
+	if alb, err := s.catalog.GetAlbumMetadataAny(ctx, albumID); err == nil {
+		artist = firstNonEmptyTrimmed(alb.Artist, artist)
+		artistID = firstNonEmptyTrimmed(alb.ArtistID, artistID)
+		if strings.TrimSpace(alb.Artist) != "" || strings.TrimSpace(alb.ArtistID) != "" {
+			return artist, artistID
+		}
+	}
+	if alb, err := s.catalog.GetCachedAlbumAny(ctx, albumID); err == nil {
+		artist = firstNonEmptyTrimmed(alb.Artist, artist)
+		artistID = firstNonEmptyTrimmed(alb.ArtistID, artistID)
+		if strings.TrimSpace(alb.Artist) != "" || strings.TrimSpace(alb.ArtistID) != "" {
+			return artist, artistID
+		}
+	}
+	if alb, err := s.catalog.GetAlbum(ctx, albumID); err == nil {
+		artist = firstNonEmptyTrimmed(alb.Artist, artist)
+		artistID = firstNonEmptyTrimmed(alb.ArtistID, artistID)
+	}
+	return artist, artistID
+}
 
 func (s *Server) tracksToSongs(in []model.Track) []subsonic.Song {
 	out := make([]subsonic.Song, 0, len(in))

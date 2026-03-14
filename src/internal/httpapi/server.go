@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +30,12 @@ type Server struct {
 	placeHolder           []byte
 	ingestOnStream        bool
 	ingestOnStar          bool
+	downloadOnStar        bool
+	downloadDir           string
+	downloadQuality       string
+	downloadRetryAttempts int
+	ffmpegOnce            sync.Once
+	ffmpegPath            string
 	dashCacheMu           sync.RWMutex
 	dashCache             map[string]dashByteMap
 }
@@ -45,8 +53,47 @@ func NewServer(logger *slog.Logger, catalog *service.CatalogService, authCreds a
 		placeHolder:           onePixelPNG(),
 		ingestOnStream:        ingestOnStream,
 		ingestOnStar:          ingestOnStar,
+		downloadOnStar:        parseEnvBoolDefault("DHWANI_DOWNLOAD_ON_STAR", false),
+		downloadDir:           strings.TrimSpace(os.Getenv("DHWANI_DOWNLOAD_DIR")),
+		downloadQuality:       strings.TrimSpace(os.Getenv("DHWANI_DOWNLOAD_QUALITY")),
+		downloadRetryAttempts: parseEnvIntDefault("DHWANI_DOWNLOAD_RETRY_ATTEMPTS", 1),
 		dashCache:             make(map[string]dashByteMap),
 	}
+}
+
+func parseEnvBoolDefault(key string, def bool) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return b
+}
+
+func parseEnvIntDefault(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
+}
+
+func (s *Server) findFFmpegPath() string {
+	s.ffmpegOnce.Do(func() {
+		if p, err := exec.LookPath("ffmpeg"); err == nil {
+			s.ffmpegPath = p
+			return
+		}
+		s.logger.Warn("ffmpeg not found; downloaded audio files will remain untagged")
+	})
+	return s.ffmpegPath
 }
 
 func (s *Server) Router() http.Handler {
