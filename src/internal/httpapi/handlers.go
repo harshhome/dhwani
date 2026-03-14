@@ -1469,7 +1469,152 @@ func (s *Server) downloadStarredTrackWithRetry(ctx context.Context, trackID stri
 }
 
 func (s *Server) downloadStarredTrack(ctx context.Context, trackID string) error {
-	return fmt.Errorf("download track transfer not implemented")
+	trackID = strings.TrimSpace(trackID)
+	if trackID == "" {
+		return fmt.Errorf("empty track id")
+	}
+	track, err := s.catalog.GetTrack(ctx, trackID)
+	if err != nil {
+		if cached, cErr := s.catalog.GetCachedTrackAny(ctx, trackID); cErr == nil {
+			track = cached
+		} else {
+			return err
+		}
+	}
+	if strings.TrimSpace(track.ID) == "" {
+		track.ID = trackID
+	}
+	qualities := parseDownloadQualities(s.downloadQuality)
+	var (
+		res             model.StreamResolution
+		resolveErr      error
+		selectedQuality string
+	)
+	if len(qualities) == 0 {
+		res, resolveErr = s.catalog.ResolveStream(ctx, trackID)
+	} else {
+		for _, q := range qualities {
+			resolveCtx := provider.WithPreferredQuality(ctx, q)
+			resolveCtx = provider.WithStrictQuality(resolveCtx, true)
+			res, resolveErr = s.catalog.ResolveStream(resolveCtx, trackID)
+			if resolveErr == nil {
+				selectedQuality = q
+				break
+			}
+		}
+		if resolveErr != nil {
+			return fmt.Errorf("none of requested download qualities satisfied (%s): %w", strings.Join(qualities, ","), resolveErr)
+		}
+	}
+	if resolveErr != nil {
+		return resolveErr
+	}
+
+	mediaURL := strings.TrimSpace(res.MediaURL)
+	dash := strings.EqualFold(res.ManifestMIME, "application/dash+xml")
+	if !dash && mediaURL == "" {
+		return fmt.Errorf("empty media url")
+	}
+	if dash && strings.TrimSpace(track.ContentType) == "" {
+		track.ContentType = "audio/mp4"
+	}
+	albumArtist, _ := s.resolveAlbumArtist(ctx, track.AlbumID, track.Artist, track.ArtistID)
+	targetPath := s.downloadPathForTrack(track, mediaURL, albumArtist)
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		return err
+	}
+	if _, err := os.Stat(targetPath); err == nil {
+		return nil
+	}
+	tmp := targetPath + ".part"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+
+	if dash {
+		plan, err := parseDashPlan(res.ManifestBase64)
+		if err != nil {
+			_ = f.Close()
+			_ = os.Remove(tmp)
+			return fmt.Errorf("parse dash manifest: %w", err)
+		}
+		if strings.TrimSpace(track.ContentType) == "" {
+			track.ContentType = plan.ContentType
+		}
+		byteMap, err := s.getOrBuildDashMap(ctx, res, plan)
+		if err != nil {
+			_ = f.Close()
+			_ = os.Remove(tmp)
+			return fmt.Errorf("build dash byte map: %w", err)
+		}
+		if byteMap.Total <= 0 {
+			_ = f.Close()
+			_ = os.Remove(tmp)
+			return fmt.Errorf("invalid dash total size")
+		}
+		if err := s.copyDashBytes(ctx, f, byteMap, 0, byteMap.Total-1); err != nil {
+			_ = f.Close()
+			_ = os.Remove(tmp)
+			return fmt.Errorf("copy dash bytes: %w", err)
+		}
+	} else {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, mediaURL, nil)
+		if err != nil {
+			_ = f.Close()
+			_ = os.Remove(tmp)
+			return err
+		}
+		resp, err := s.httpClient.Do(req)
+		if err != nil {
+			_ = f.Close()
+			_ = os.Remove(tmp)
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			_ = f.Close()
+			_ = os.Remove(tmp)
+			return downloadHTTPStatusError{status: resp.StatusCode}
+		}
+		if _, err := io.Copy(f, resp.Body); err != nil {
+			_ = f.Close()
+			_ = os.Remove(tmp)
+			return err
+		}
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	actualExt, detectErr := detectAudioExtFromFile(tmp)
+	if detectErr != nil {
+		_ = os.Remove(tmp)
+		return detectErr
+	}
+	if actualExt != "" {
+		curExt := strings.TrimPrefix(strings.ToLower(filepath.Ext(targetPath)), ".")
+		if curExt != actualExt {
+			targetPath = strings.TrimSuffix(targetPath, filepath.Ext(targetPath)) + "." + actualExt
+		}
+	}
+	if err := os.Rename(tmp, targetPath); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	albumYear := 0
+	if strings.TrimSpace(track.AlbumID) != "" {
+		if alb, err := s.catalog.GetAlbumMetadataAny(ctx, track.AlbumID); err == nil {
+			if albumYear == 0 {
+				albumYear = alb.Year
+			}
+		}
+	}
+	if err := s.tagDownloadedAudio(ctx, targetPath, track, albumArtist, albumYear); err != nil {
+		s.logger.Warn("star track tagging failed", "id", trackID, "path", targetPath, "err", err)
+	}
+	s.logger.Info("star download completed", "track_id", trackID, "path", targetPath, "quality", firstNonEmptyTrimmed(selectedQuality, "provider-default"))
+	return nil
 }
 
 func isRetryableDownloadError(err error) bool {
@@ -1498,6 +1643,18 @@ func isRetryableDownloadError(err error) bool {
 		return true
 	}
 	return false
+}
+
+func (s *Server) downloadPathForTrack(t model.Track, mediaURL string, albumArtist string) string {
+	artist := safePathSegment(firstNonEmptyTrimmed(albumArtist, t.Artist, "Unknown Artist"))
+	album := safePathSegment(firstNonEmptyTrimmed(t.Album, "Unknown Album"))
+	title := safePathSegment(firstNonEmptyTrimmed(t.Title, strings.TrimSpace(t.ID), "track"))
+	trackNo := t.TrackNumber
+	if trackNo < 0 {
+		trackNo = 0
+	}
+	filename := fmt.Sprintf("%d - %s.%s", trackNo, title, downloadExt(t, mediaURL))
+	return filepath.Join(s.downloadDir, artist, album, filename)
 }
 
 func firstNonEmptyTrimmed(values ...string) string {
