@@ -1,12 +1,22 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"image"
+	"image/draw"
+	"image/jpeg"
 	_ "image/png"
 	"io"
+	"math"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -1697,6 +1707,74 @@ func (s *Server) resolveAlbumArtist(ctx context.Context, albumID string, fallbac
 	return artist, artistID
 }
 
+func parseDownloadQualities(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	seen := map[string]struct{}{}
+	for _, p := range parts {
+		q := strings.ToUpper(strings.TrimSpace(p))
+		if q == "" {
+			continue
+		}
+		if _, ok := seen[q]; ok {
+			continue
+		}
+		seen[q] = struct{}{}
+		out = append(out, q)
+	}
+	return out
+}
+
+func safePathSegment(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "_"
+	}
+	replacer := strings.NewReplacer(
+		"/", "_",
+		"\\", "_",
+		":", "_",
+		"*", "_",
+		"?", "_",
+		"\"", "_",
+		"<", "_",
+		">", "_",
+		"|", "_",
+	)
+	v = replacer.Replace(v)
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "_"
+	}
+	return v
+}
+
+func downloadExt(t model.Track, mediaURL string) string {
+	ct := strings.ToLower(strings.TrimSpace(t.ContentType))
+	switch {
+	case strings.Contains(ct, "flac"):
+		return "flac"
+	case strings.Contains(ct, "mpeg"), strings.Contains(ct, "mp3"):
+		return "mp3"
+	case strings.Contains(ct, "aac"):
+		return "aac"
+	case strings.Contains(ct, "mp4"):
+		return "m4a"
+	}
+	u, err := url.Parse(mediaURL)
+	if err == nil {
+		ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(u.Path)), ".")
+		if ext != "" {
+			return ext
+		}
+	}
+	return "flac"
+}
+
 func (s *Server) tracksToSongs(in []model.Track) []subsonic.Song {
 	out := make([]subsonic.Song, 0, len(in))
 	for _, t := range in {
@@ -1704,6 +1782,193 @@ func (s *Server) tracksToSongs(in []model.Track) []subsonic.Song {
 	}
 	return out
 }
+
+func (s *Server) tagDownloadedAudio(ctx context.Context, path string, t model.Track, albumArtist string, albumYear int) error {
+	ffmpegPath := s.findFFmpegPath()
+	if strings.TrimSpace(ffmpegPath) == "" {
+		return nil
+	}
+	coverPath, err := s.prepareCoverArtForAudio(ctx, t)
+	if err != nil {
+		return fmt.Errorf("prepare cover art: %w", err)
+	}
+	if strings.TrimSpace(coverPath) != "" {
+		defer os.Remove(coverPath)
+	}
+	outPath := path + ".tag.tmp" + filepath.Ext(path)
+	_ = os.Remove(outPath)
+
+	args := []string{
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-i", path,
+	}
+	if strings.TrimSpace(coverPath) != "" {
+		args = append(args,
+			"-i", coverPath,
+			"-map", "0:a",
+			"-map", "1:v",
+			"-c:a", "copy",
+			"-c:v", "mjpeg",
+			"-disposition:v", "attached_pic",
+		)
+	} else {
+		args = append(args,
+			"-map", "0:a",
+			"-c:a", "copy",
+		)
+	}
+	args = append(args, buildFFmpegMetadataArgs(t, albumArtist, albumYear)...)
+	if strings.EqualFold(strings.TrimPrefix(filepath.Ext(path), "."), "m4a") {
+		// Prevent ffmpeg from auto-picking the ipod muxer for .m4a, which rejects
+		// some copied codecs (for example FLAC). Use generic MP4 muxer instead.
+		args = append(args, "-f", "mp4")
+	}
+	args = append(args, outPath)
+
+	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		_ = os.Remove(outPath)
+		return fmt.Errorf("ffmpeg tagging failed: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	if err := os.Rename(outPath, path); err != nil {
+		_ = os.Remove(outPath)
+		return err
+	}
+	return nil
+}
+
+func detectAudioExtFromFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	head := make([]byte, 32)
+	n, err := io.ReadFull(f, head)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return "", err
+	}
+	head = head[:n]
+	if len(head) >= 4 && string(head[:4]) == "fLaC" {
+		return "flac", nil
+	}
+	if len(head) >= 12 && string(head[4:8]) == "ftyp" {
+		return "m4a", nil
+	}
+	if len(head) >= 3 && string(head[:3]) == "ID3" {
+		return "mp3", nil
+	}
+	if len(head) >= 2 && head[0] == 0xFF && (head[1]&0xE0) == 0xE0 {
+		return "mp3", nil
+	}
+	return "", nil
+}
+
+func buildFFmpegMetadataArgs(t model.Track, albumArtist string, albumYear int) []string {
+	args := []string{}
+	appendTag := func(k string, v string) {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return
+		}
+		args = append(args, "-metadata", k+"="+v)
+	}
+	appendTag("title", t.Title)
+	appendTag("artist", firstNonEmptyTrimmed(t.DisplayArtist, t.Artist))
+	appendTag("album", t.Album)
+	appendTag("album_artist", firstNonEmptyTrimmed(albumArtist, t.Artist))
+	if albumYear > 0 {
+		appendTag("date", strconv.Itoa(albumYear))
+	}
+	if t.TrackNumber > 0 {
+		appendTag("track", strconv.Itoa(t.TrackNumber))
+	}
+	if t.DiscNumber > 0 {
+		appendTag("disc", strconv.Itoa(t.DiscNumber))
+	}
+	appendTag("genre", t.Genre)
+	return args
+}
+
+func (s *Server) prepareCoverArtForAudio(ctx context.Context, t model.Track) (string, error) {
+	coverURL := firstNonEmptyTrimmed(
+		t.CoverArtURL,
+		s.catalog.ResolveCoverArtURL(ctx, t.ID),
+		s.catalog.ResolveCoverArtURL(ctx, t.AlbumID),
+	)
+	if coverURL == "" {
+		return "", nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, coverURL, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("cover art status %d", resp.StatusCode)
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 20<<20))
+	if err != nil {
+		return "", err
+	}
+	img, _, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return "", err
+	}
+	square := resizeAndCropSquare(img, 1200)
+	tmp, err := os.CreateTemp("", "dhwani-cover-*.jpg")
+	if err != nil {
+		return "", err
+	}
+	defer tmp.Close()
+	if err := jpeg.Encode(tmp, square, &jpeg.Options{Quality: 92}); err != nil {
+		_ = os.Remove(tmp.Name())
+		return "", err
+	}
+	return tmp.Name(), nil
+}
+
+func resizeAndCropSquare(src image.Image, size int) image.Image {
+	if size <= 0 {
+		size = 1200
+	}
+	b := src.Bounds()
+	srcW, srcH := b.Dx(), b.Dy()
+	if srcW <= 0 || srcH <= 0 {
+		return image.NewRGBA(image.Rect(0, 0, size, size))
+	}
+	scale := math.Max(float64(size)/float64(srcW), float64(size)/float64(srcH))
+	scaledW := int(math.Ceil(float64(srcW) * scale))
+	scaledH := int(math.Ceil(float64(srcH) * scale))
+	if scaledW < size {
+		scaledW = size
+	}
+	if scaledH < size {
+		scaledH = size
+	}
+
+	scaled := image.NewRGBA(image.Rect(0, 0, scaledW, scaledH))
+	for y := 0; y < scaledH; y++ {
+		sy := b.Min.Y + (y*srcH)/scaledH
+		for x := 0; x < scaledW; x++ {
+			sx := b.Min.X + (x*srcW)/scaledW
+			scaled.Set(x, y, src.At(sx, sy))
+		}
+	}
+
+	dst := image.NewRGBA(image.Rect(0, 0, size, size))
+	offX := (scaledW - size) / 2
+	offY := (scaledH - size) / 2
+	draw.Draw(dst, dst.Bounds(), scaled, image.Pt(offX, offY), draw.Src)
+	return dst
+}
+
 func (s *Server) displayID(v string) string {
 	return strings.TrimSpace(v)
 }
