@@ -2,12 +2,15 @@ package httpapi
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -614,5 +617,248 @@ func TestGetStarredIncludesArtistsAlbumsAndSongs(t *testing.T) {
 	}
 	if got := len(starred["song"].([]any)); got != 1 {
 		t.Fatalf("expected 1 starred song, got %d", got)
+	}
+}
+
+func TestParseDownloadQualities(t *testing.T) {
+	got := parseDownloadQualities(" LOSSLESS, high,LOSSLESS , low ")
+	if len(got) != 3 || got[0] != "LOSSLESS" || got[1] != "HIGH" || got[2] != "LOW" {
+		t.Fatalf("unexpected qualities: %#v", got)
+	}
+}
+
+func TestDownloadStarredTrackDASH(t *testing.T) {
+	segments := map[string][]byte{
+		"/init.mp4": []byte("INIT"),
+		"/1.m4s":    []byte("AUDIO1"),
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, ok := segments[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if rg := r.Header.Get("Range"); rg != "" {
+			raw := strings.TrimPrefix(rg, "bytes=")
+			p := strings.SplitN(raw, "-", 2)
+			start, _ := strconv.Atoi(p[0])
+			end, _ := strconv.Atoi(p[1])
+			if end >= len(data) {
+				end = len(data) - 1
+			}
+			chunk := data[start : end+1]
+			w.Header().Set("Content-Range", "bytes "+strconv.Itoa(start)+"-"+strconv.Itoa(end)+"/"+strconv.Itoa(len(data)))
+			w.Header().Set("Content-Length", strconv.Itoa(len(chunk)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(chunk)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+	}))
+	defer upstream.Close()
+
+	mpd := `<?xml version="1.0" encoding="UTF-8"?><MPD><Period><AdaptationSet mimeType="audio/mp4"><Representation id="r1"><SegmentTemplate initialization="` + upstream.URL + `/init.mp4" media="` + upstream.URL + `/$Number$.m4s" startNumber="1"><SegmentTimeline><S d="1"/></SegmentTimeline></SegmentTemplate></Representation></AdaptationSet></Period></MPD>`
+	manifest := base64.StdEncoding.EncodeToString([]byte(mpd))
+
+	fp := &fakeProvider{
+		track: model.Track{
+			ID:          "t-dash-dl",
+			Provider:    "triton",
+			ProviderID:  "t-dash-dl",
+			Title:       "Dash Song",
+			Artist:      "Dash Artist",
+			Album:       "Dash Album",
+			ArtistID:    "ar-dash",
+			AlbumID:     "al-dash",
+			ContentType: "audio/mp4",
+		},
+		streamRes: model.StreamResolution{
+			Provider:        "triton",
+			TrackProviderID: "t-dash-dl",
+			ManifestMIME:    "application/dash+xml",
+			ManifestBase64:  manifest,
+			ManifestHash:    "h-dash",
+		},
+	}
+	srv, store := newTestServer(t, fp, false)
+	defer store.Close()
+	srv.downloadOnStar = true
+	srv.downloadDir = t.TempDir()
+
+	if err := srv.downloadStarredTrack(context.Background(), "t-dash-dl"); err != nil {
+		t.Fatalf("downloadStarredTrack dash failed: %v", err)
+	}
+
+	base := filepath.Join(srv.downloadDir, "Dash Artist", "Dash Album")
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		t.Fatalf("read download dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 downloaded file, got %d", len(entries))
+	}
+	got, err := os.ReadFile(filepath.Join(base, entries[0].Name()))
+	if err != nil {
+		t.Fatalf("read downloaded file: %v", err)
+	}
+	if string(got) != "INITAUDIO1" {
+		t.Fatalf("unexpected downloaded content: %q", string(got))
+	}
+}
+
+func TestDownloadStarredTrackWithRetryOnTransientHTTPStatus(t *testing.T) {
+	attempts := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok-audio"))
+	}))
+	defer upstream.Close()
+
+	fp := &fakeProvider{
+		track: model.Track{
+			ID:          "t-retry",
+			Provider:    "triton",
+			ProviderID:  "t-retry",
+			Title:       "Retry Song",
+			Artist:      "Retry Artist",
+			Album:       "Retry Album",
+			ArtistID:    "ar-r",
+			AlbumID:     "al-r",
+			ContentType: "audio/flac",
+		},
+		streamURL: upstream.URL,
+	}
+	srv, store := newTestServer(t, fp, false)
+	defer store.Close()
+	srv.downloadOnStar = true
+	srv.downloadDir = t.TempDir()
+	srv.downloadRetryAttempts = 3
+
+	if err := srv.downloadStarredTrackWithRetry(context.Background(), "t-retry"); err != nil {
+		t.Fatalf("downloadStarredTrackWithRetry failed: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected 2 attempts, got %d", attempts)
+	}
+	base := filepath.Join(srv.downloadDir, "Retry Artist", "Retry Album")
+	entries, err := os.ReadDir(base)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected one downloaded file, err=%v entries=%d", err, len(entries))
+	}
+}
+
+func TestDownloadStarredTrackNoRetryWhenNoFullStream(t *testing.T) {
+	fp := &fakeProvider{
+		track: model.Track{
+			ID:          "t-no-stream",
+			Provider:    "triton",
+			ProviderID:  "t-no-stream",
+			Title:       "No Stream",
+			Artist:      "Artist",
+			Album:       "Album",
+			ArtistID:    "ar-x",
+			AlbumID:     "al-x",
+			ContentType: "audio/flac",
+		},
+		streamErr: provider.ErrNoFullStream,
+	}
+	srv, store := newTestServer(t, fp, false)
+	defer store.Close()
+	srv.downloadOnStar = true
+	srv.downloadDir = t.TempDir()
+	srv.downloadRetryAttempts = 5
+
+	err := srv.downloadStarredTrackWithRetry(context.Background(), "t-no-stream")
+	if err == nil {
+		t.Fatalf("expected error for no full stream")
+	}
+	if fp.getTrackCalls.Load() != 1 {
+		t.Fatalf("expected no retry when no stream; getTrack calls=%d", fp.getTrackCalls.Load())
+	}
+}
+
+func TestUnstarClassifiesAlbumIDFromIDParam(t *testing.T) {
+	srv, store := newTestServer(t, nil, false)
+	defer store.Close()
+	ctx := context.Background()
+
+	if err := store.UpsertAlbumMetadata(ctx, model.Album{
+		ID:         "282205038",
+		Provider:   "triton",
+		ProviderID: "282205038",
+		Name:       "Album To Unstar",
+		Artist:     "Artist A",
+		ArtistID:   "901",
+	}); err != nil {
+		t.Fatalf("seed album: %v", err)
+	}
+	if err := store.StarItem(ctx, "album", "triton", "282205038"); err != nil {
+		t.Fatalf("star album: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/rest/unstar.view?u=u&p=p&v=1.16.1&c=test&f=json&id=al-282205038", nil)
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unstar status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	albums, err := store.ListStarredAlbums(ctx, 10, 0)
+	if err != nil {
+		t.Fatalf("list starred albums: %v", err)
+	}
+	if len(albums) != 0 {
+		t.Fatalf("expected no starred albums after unstar, got %d", len(albums))
+	}
+	if _, err := store.GetCachedAlbum(ctx, "282205038"); err == nil {
+		t.Fatalf("expected album metadata removed after unstar")
+	}
+}
+
+func TestUnstarClassifiesArtistIDFromIDParam(t *testing.T) {
+	srv, store := newTestServer(t, nil, false)
+	defer store.Close()
+	ctx := context.Background()
+
+	if err := store.UpsertArtistMetadata(ctx, model.Artist{
+		ID:         "123",
+		Provider:   "triton",
+		ProviderID: "123",
+		Name:       "Artist To Unstar",
+	}); err != nil {
+		t.Fatalf("seed artist: %v", err)
+	}
+	if err := store.StarItem(ctx, "artist", "triton", "123"); err != nil {
+		t.Fatalf("star artist: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/rest/unstar.view?u=u&p=p&v=1.16.1&c=test&f=json&id=ar-123", nil)
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unstar status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	artists, err := store.ListStarredArtists(ctx, 10, 0)
+	if err != nil {
+		t.Fatalf("list starred artists: %v", err)
+	}
+	if len(artists) != 0 {
+		t.Fatalf("expected no starred artists after unstar, got %d", len(artists))
+	}
+	if _, err := store.GetCachedArtist(ctx, "123"); err == nil {
+		t.Fatalf("expected artist metadata removed after unstar")
 	}
 }
