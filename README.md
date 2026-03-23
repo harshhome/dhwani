@@ -58,6 +58,7 @@ DHWANI_DOWNLOAD_ON_STAR=true
 DHWANI_DOWNLOAD_DIR=/absolute/path/to/downloads
 DHWANI_DOWNLOAD_QUALITY=HI_RES_LOSSLESS,LOSSLESS
 DHWANI_DOWNLOAD_RETRY_ATTEMPTS=3
+DHWANI_DOWNLOAD_LRC=true
 ```
 
 ## Run
@@ -87,3 +88,4 @@ curl -L "$BASE/rest/stream.view?u=$U&p=$P&v=1.16.1&c=curl&id=<track-id>" -o samp
 - `star`/`unstar` endpoints persist star state to local SQLite
 - `getLyrics` and `getLyricsBySongId` resolve lyrics from upstream providers
 - When download-on-star is enabled, starring a song/album queues background download work
+- Optional: set `DHWANI_DOWNLOAD_LRC=true` to create a sidecar `.lrc` file (same basename as audio, e.g. `song.flac` + `song.lrc`) using synced upstream lyric lines
