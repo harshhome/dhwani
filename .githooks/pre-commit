@@ -1,0 +1,26 @@
+#!/bin/sh
+
+# Block commits with more than 300 staged insertions.
+# Counts staged text changes from `git diff --cached --numstat`.
+MAX_INSERTIONS=300
+
+INSERTIONS=$(git diff --cached --numstat | awk '
+  {
+    # Skip binary entries where added/deleted are "-"
+    if ($1 ~ /^[0-9]+$/) {
+      added += $1
+    }
+  }
+  END {
+    print added + 0
+  }
+')
+
+if [ "$INSERTIONS" -gt "$MAX_INSERTIONS" ]; then
+  echo "pre-commit: blocked"
+  echo "staged insertions: $INSERTIONS (limit: $MAX_INSERTIONS)"
+  echo "Split this into smaller commits before committing."
+  exit 1
+fi
+
+exit 0
