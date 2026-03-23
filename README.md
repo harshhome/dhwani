@@ -26,7 +26,7 @@ Dhwani is a self-hosted Subsonic/OpenSubsonic-compatible music proxy server writ
 ### Option 1: Build from source
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/harshhome/dhwani
 cd dhwani/src
 go mod download
 go build -o dhwani ./cmd/dhwani
@@ -35,7 +35,7 @@ go build -o dhwani ./cmd/dhwani
 ### Option 2: Docker
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/harshhome/dhwani
 cd dhwani
 docker build -f deploy/docker/Dockerfile -t dhwani:latest .
 ```
