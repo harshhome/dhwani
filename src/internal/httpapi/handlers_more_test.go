@@ -627,6 +627,181 @@ func TestParseDownloadQualities(t *testing.T) {
 	}
 }
 
+func TestSyncedLyricsToLRC(t *testing.T) {
+	got, ok := syncedLyricsToLRC([]model.LyricLine{
+		{StartMs: 65432, Value: "line two"},
+		{StartMs: -1, Value: "skip"},
+		{StartMs: 1234, Value: "line one"},
+		{StartMs: 2000, Value: "   "},
+	})
+	if !ok {
+		t.Fatalf("expected syncedLyricsToLRC to produce output")
+	}
+	want := "[00:01.23]line one\n[01:05.43]line two\n"
+	if got != want {
+		t.Fatalf("unexpected lrc content:\nwant=%q\ngot=%q", want, got)
+	}
+}
+
+func TestDownloadStarredTrackWritesLRCSidecarWhenEnabled(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("fLaCdemo-audio"))
+	}))
+	defer upstream.Close()
+
+	fp := &fakeProvider{
+		track: model.Track{
+			ID:          "t-lrc",
+			Provider:    "triton",
+			ProviderID:  "t-lrc",
+			Title:       "LRC Song",
+			Artist:      "LRC Artist",
+			Album:       "LRC Album",
+			ArtistID:    "ar-lrc",
+			AlbumID:     "al-lrc",
+			ContentType: "audio/flac",
+		},
+		streamURL: upstream.URL,
+		lyrics: model.Lyrics{
+			Lines: []model.LyricLine{
+				{StartMs: 1234, Value: "line one"},
+				{StartMs: 65432, Value: "line two"},
+			},
+		},
+	}
+	srv, store := newTestServer(t, fp, false)
+	defer store.Close()
+	srv.downloadOnStar = true
+	srv.downloadLRCOnStar = true
+	srv.downloadDir = t.TempDir()
+
+	if err := srv.downloadStarredTrack(context.Background(), "t-lrc"); err != nil {
+		t.Fatalf("downloadStarredTrack failed: %v", err)
+	}
+
+	base := filepath.Join(srv.downloadDir, "LRC Artist", "LRC Album")
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		t.Fatalf("read download dir: %v", err)
+	}
+	audioName := ""
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasSuffix(name, ".flac") || strings.HasSuffix(name, ".m4a") {
+			audioName = name
+			break
+		}
+	}
+	if audioName == "" {
+		t.Fatalf("expected downloaded audio file, entries=%d", len(entries))
+	}
+	lrcName := strings.TrimSuffix(audioName, filepath.Ext(audioName)) + ".lrc"
+	lrcBytes, err := os.ReadFile(filepath.Join(base, lrcName))
+	if err != nil {
+		t.Fatalf("read .lrc sidecar: %v", err)
+	}
+	want := "[00:01.23]line one\n[01:05.43]line two\n"
+	if string(lrcBytes) != want {
+		t.Fatalf("unexpected .lrc content:\nwant=%q\ngot=%q", want, string(lrcBytes))
+	}
+}
+
+func TestDownloadStarredTrackWritesLRCSidecarForM4A(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte{0x00, 0x00, 0x00, 0x20, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm', 0x00, 0x00, 0x00, 0x00})
+	}))
+	defer upstream.Close()
+
+	fp := &fakeProvider{
+		track: model.Track{
+			ID:          "t-lrc-m4a",
+			Provider:    "triton",
+			ProviderID:  "t-lrc-m4a",
+			Title:       "M4A Song",
+			Artist:      "M4A Artist",
+			Album:       "M4A Album",
+			ArtistID:    "ar-m4a",
+			AlbumID:     "al-m4a",
+			ContentType: "audio/mp4",
+		},
+		streamURL: upstream.URL,
+		lyrics: model.Lyrics{
+			Lines: []model.LyricLine{{StartMs: 1000, Value: "line one"}},
+		},
+	}
+	srv, store := newTestServer(t, fp, false)
+	defer store.Close()
+	srv.downloadOnStar = true
+	srv.downloadLRCOnStar = true
+	srv.downloadDir = t.TempDir()
+
+	if err := srv.downloadStarredTrack(context.Background(), "t-lrc-m4a"); err != nil {
+		t.Fatalf("downloadStarredTrack failed: %v", err)
+	}
+
+	base := filepath.Join(srv.downloadDir, "M4A Artist", "M4A Album")
+	audioPath := filepath.Join(base, "0 - M4A Song.m4a")
+	if _, err := os.Stat(audioPath); err != nil {
+		t.Fatalf("expected .m4a audio file, err=%v", err)
+	}
+	lrcPath := filepath.Join(base, "0 - M4A Song.lrc")
+	lrcBytes, err := os.ReadFile(lrcPath)
+	if err != nil {
+		t.Fatalf("read .lrc sidecar: %v", err)
+	}
+	if string(lrcBytes) != "[00:01.00]line one\n" {
+		t.Fatalf("unexpected .lrc content: %q", string(lrcBytes))
+	}
+}
+
+func TestDownloadStarredTrackSkipsLRCSidecarWhenDisabled(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("fLaCdemo-audio"))
+	}))
+	defer upstream.Close()
+
+	fp := &fakeProvider{
+		track: model.Track{
+			ID:          "t-lrc-off",
+			Provider:    "triton",
+			ProviderID:  "t-lrc-off",
+			Title:       "No LRC Song",
+			Artist:      "No LRC Artist",
+			Album:       "No LRC Album",
+			ArtistID:    "ar-lrc-off",
+			AlbumID:     "al-lrc-off",
+			ContentType: "audio/flac",
+		},
+		streamURL: upstream.URL,
+		lyrics: model.Lyrics{
+			Lines: []model.LyricLine{{StartMs: 2000, Value: "line one"}},
+		},
+	}
+	srv, store := newTestServer(t, fp, false)
+	defer store.Close()
+	srv.downloadOnStar = true
+	srv.downloadLRCOnStar = false
+	srv.downloadDir = t.TempDir()
+
+	if err := srv.downloadStarredTrack(context.Background(), "t-lrc-off"); err != nil {
+		t.Fatalf("downloadStarredTrack failed: %v", err)
+	}
+
+	base := filepath.Join(srv.downloadDir, "No LRC Artist", "No LRC Album")
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		t.Fatalf("read download dir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".lrc") {
+			t.Fatalf("expected no .lrc sidecar when disabled, found %q", e.Name())
+		}
+	}
+}
+
 func TestDownloadStarredTrackDASH(t *testing.T) {
 	segments := map[string][]byte{
 		"/init.mp4": []byte("INIT"),
