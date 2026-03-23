@@ -1115,7 +1115,6 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("stream finished", "id", id, "status", up.StatusCode)
 }
 
-
 func (s *Server) proxyBinary(w http.ResponseWriter, r *http.Request, target string) {
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
 	if err != nil {
@@ -1534,6 +1533,11 @@ func (s *Server) downloadStarredTrack(ctx context.Context, trackID string) error
 		return err
 	}
 	if _, err := os.Stat(targetPath); err == nil {
+		if s.downloadLRCOnStar {
+			if err := s.writeSyncedLyricsSidecar(ctx, trackID, targetPath); err != nil {
+				s.logger.Warn("star download lyrics sidecar failed", "id", trackID, "path", targetPath, "err", err)
+			}
+		}
 		return nil
 	}
 	tmp := targetPath + ".part"
@@ -1623,6 +1627,11 @@ func (s *Server) downloadStarredTrack(ctx context.Context, trackID string) error
 	if err := s.tagDownloadedAudio(ctx, targetPath, track, albumArtist, albumYear); err != nil {
 		s.logger.Warn("star track tagging failed", "id", trackID, "path", targetPath, "err", err)
 	}
+	if s.downloadLRCOnStar {
+		if err := s.writeSyncedLyricsSidecar(ctx, trackID, targetPath); err != nil {
+			s.logger.Warn("star download lyrics sidecar failed", "id", trackID, "path", targetPath, "err", err)
+		}
+	}
 	s.logger.Info("star download completed", "track_id", trackID, "path", targetPath, "quality", firstNonEmptyTrimmed(selectedQuality, "provider-default"))
 	return nil
 }
@@ -1665,6 +1674,64 @@ func (s *Server) downloadPathForTrack(t model.Track, mediaURL string, albumArtis
 	}
 	filename := fmt.Sprintf("%d - %s.%s", trackNo, title, downloadExt(t, mediaURL))
 	return filepath.Join(s.downloadDir, artist, album, filename)
+}
+
+func (s *Server) writeSyncedLyricsSidecar(ctx context.Context, trackID string, audioPath string) error {
+	lyrics, err := s.catalog.GetLyrics(ctx, trackID)
+	if err != nil {
+		return err
+	}
+	lrc, ok := syncedLyricsToLRC(lyrics.Lines)
+	if !ok {
+		return fmt.Errorf("no synced lyrics available")
+	}
+	lrcPath := strings.TrimSuffix(audioPath, filepath.Ext(audioPath)) + ".lrc"
+	tmpPath := lrcPath + ".part"
+	if err := os.WriteFile(tmpPath, []byte(lrc), 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, lrcPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
+func syncedLyricsToLRC(lines []model.LyricLine) (string, bool) {
+	clean := make([]model.LyricLine, 0, len(lines))
+	for _, ln := range lines {
+		text := strings.TrimSpace(ln.Value)
+		if text == "" || ln.StartMs < 0 {
+			continue
+		}
+		clean = append(clean, model.LyricLine{StartMs: ln.StartMs, Value: text})
+	}
+	if len(clean) == 0 {
+		return "", false
+	}
+	sort.SliceStable(clean, func(i, j int) bool {
+		return clean[i].StartMs < clean[j].StartMs
+	})
+
+	var b strings.Builder
+	for _, ln := range clean {
+		b.WriteString("[")
+		b.WriteString(formatLRCTimestamp(ln.StartMs))
+		b.WriteString("]")
+		b.WriteString(ln.Value)
+		b.WriteString("\n")
+	}
+	return b.String(), true
+}
+
+func formatLRCTimestamp(ms int64) string {
+	if ms < 0 {
+		ms = 0
+	}
+	minutes := ms / 60000
+	seconds := (ms % 60000) / 1000
+	centis := (ms % 1000) / 10
+	return fmt.Sprintf("%02d:%02d.%02d", minutes, seconds, centis)
 }
 
 func firstNonEmptyTrimmed(values ...string) string {

@@ -31,6 +31,7 @@ type Server struct {
 	ingestOnStream        bool
 	ingestOnStar          bool
 	downloadOnStar        bool
+	downloadLRCOnStar     bool
 	downloadDir           string
 	downloadQuality       string
 	downloadRetryAttempts int
@@ -54,6 +55,7 @@ func NewServer(logger *slog.Logger, catalog *service.CatalogService, authCreds a
 		ingestOnStream:        ingestOnStream,
 		ingestOnStar:          ingestOnStar,
 		downloadOnStar:        parseEnvBoolDefault("DHWANI_DOWNLOAD_ON_STAR", false),
+		downloadLRCOnStar:     parseEnvBoolDefault("DHWANI_DOWNLOAD_LRC", false),
 		downloadDir:           strings.TrimSpace(os.Getenv("DHWANI_DOWNLOAD_DIR")),
 		downloadQuality:       strings.TrimSpace(os.Getenv("DHWANI_DOWNLOAD_QUALITY")),
 		downloadRetryAttempts: parseEnvIntDefault("DHWANI_DOWNLOAD_RETRY_ATTEMPTS", 1),
